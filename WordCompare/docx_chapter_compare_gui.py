@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
 docx_chapter_compare_gui.py
-Version 1.6 / 2026-09-05 / Grund: Checkbox "Zusätzlich Word-Report erzeugen"
-    ergänzt (nutzt generate_docx_report aus docx_chapter_compare.py v2.4) -
-    Ausgabe landet neben dem HTML-Report mit gleichem Namen, .docx-Endung.
+Version 1.8 / 2026-09-05 / Grund: Echte (determinate) Fortschrittsanzeige
+    statt nur "laeuft/laeuft nicht" - zeigt Schritt X von Y mit Klartext-
+    Label (z.B. "[3/6] Seiten ermitteln..."), Gesamtzahl haengt von den
+    aktivierten Optionen ab. Neue Checkbox "Moegliche Kapitel-Verschiebungen
+    erkennen" (Standard: an) zum Ein-/Ausschalten von detect_possible_moves.
 
 Desktop-GUI (Tkinter, keine Zusatz-Installation noetig) fuer den
 Kapitelvergleich zweier Word-Dokumente. Nutzt dieselbe Vergleichslogik und
@@ -27,7 +29,7 @@ import webbrowser
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-GUI_VERSION = "1.6"
+GUI_VERSION = "1.8"
 
 try:
     import docx_chapter_compare as _core
@@ -35,6 +37,7 @@ try:
         attach_pages,
         build_comparison,
         compute_stats,
+        detect_possible_moves,
         doc_metadata,
         extract_chapters,
         generate_docx_report,
@@ -78,8 +81,8 @@ class CompareApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(f"DOCX Kapitelvergleich  —  GUI v{GUI_VERSION} · Core v{CORE_VERSION}")
-        self.geometry("640x460")
-        self.minsize(560, 390)
+        self.geometry("640x500")
+        self.minsize(560, 420)
         self.resizable(True, False)
 
         self.cfg = load_config()
@@ -90,6 +93,7 @@ class CompareApp(tk.Tk):
         self.var_status = tk.StringVar(value="Bereit.")
         self.var_ignore_linebreaks = tk.BooleanVar(value=self.cfg.get("ignore_linebreaks", True))
         self.var_detect_pages = tk.BooleanVar(value=self.cfg.get("detect_pages", True))
+        self.var_detect_moves = tk.BooleanVar(value=self.cfg.get("detect_moves", True))
         self.var_export_docx = tk.BooleanVar(value=self.cfg.get("export_docx", False))
 
         self._build_ui()
@@ -136,20 +140,28 @@ class CompareApp(tk.Tk):
         ).grid(row=7, column=0, columnspan=3, sticky="w", padx=10, pady=(2, 0))
 
         ttk.Checkbutton(
+            frame, text="Mögliche Kapitel-Verschiebungen erkennen",
+            variable=self.var_detect_moves,
+        ).grid(row=8, column=0, columnspan=3, sticky="w", padx=10, pady=(2, 0))
+
+        ttk.Checkbutton(
             frame, text="Zusätzlich Word-Report erzeugen (kompakt, für schnelle Weitergabe im Unternehmen)",
             variable=self.var_export_docx,
-        ).grid(row=8, column=0, columnspan=3, sticky="w", padx=10, pady=(2, 0))
+        ).grid(row=9, column=0, columnspan=3, sticky="w", padx=10, pady=(2, 0))
 
         frame.columnconfigure(1, weight=1)
 
         self.btn_compare = ttk.Button(frame, text="Vergleichen ▶", command=self.run_compare)
-        self.btn_compare.grid(row=9, column=0, padx=10, pady=16, sticky="w")
+        self.btn_compare.grid(row=10, column=0, padx=10, pady=(16, 4), sticky="w")
 
-        self.progress = ttk.Progressbar(frame, mode="indeterminate")
-        self.progress.grid(row=9, column=1, columnspan=2, padx=10, pady=16, sticky="ew")
+        self.progress = ttk.Progressbar(frame, mode="determinate", maximum=1, value=0)
+        self.progress.grid(row=10, column=1, columnspan=2, padx=10, pady=(16, 4), sticky="ew")
+
+        self.progress_label = ttk.Label(frame, text="", foreground="#666", font=("", 9))
+        self.progress_label.grid(row=11, column=0, columnspan=3, sticky="w", padx=10)
 
         self.stats_label = ttk.Label(frame, text="", justify="left")
-        self.stats_label.grid(row=10, column=0, columnspan=3, sticky="w", padx=10)
+        self.stats_label.grid(row=12, column=0, columnspan=3, sticky="w", padx=10, pady=(6, 0))
 
         status_bar = ttk.Label(self, textvariable=self.var_status, relief="sunken", anchor="w")
         status_bar.pack(fill="x", side="bottom")
@@ -205,26 +217,53 @@ class CompareApp(tk.Tk):
             messagebox.showerror("Datei nicht gefunden", f"Dokument B nicht gefunden:\n{path_b}")
             return
 
+        ignore_linebreaks = self.var_ignore_linebreaks.get()
+        detect_pages = self.var_detect_pages.get()
+        detect_moves = self.var_detect_moves.get()
+        export_docx = self.var_export_docx.get()
+
+        # Schritt-Liste VORHER exakt so aufbauen, wie sie im Worker durchlaufen
+        # wird - daraus ergibt sich die Gesamtzahl fuer die Fortschrittsanzeige.
+        steps = ["Dokument A einlesen", "Dokument B einlesen"]
+        if detect_pages:
+            steps += ["Preflight-Check Seiten-Gruppierung", "Seiten ermitteln"]
+        steps += ["Vergleich berechnen"]
+        if detect_moves:
+            steps += ["Verschiebungen erkennen"]
+        steps += ["Report schreiben"]
+        if export_docx:
+            steps += ["Word-Report erzeugen"]
+
         self.btn_compare.config(state="disabled")
-        self.progress.start(12)
+        self.progress.config(mode="determinate", maximum=len(steps), value=0)
+        self.progress_label.config(text=f"[0/{len(steps)}] Bereit …")
         self.var_status.set("Vergleiche Dokumente …")
         self.stats_label.config(text="")
 
-        ignore_linebreaks = self.var_ignore_linebreaks.get()
-        detect_pages = self.var_detect_pages.get()
-        export_docx = self.var_export_docx.get()
-
         thread = threading.Thread(
             target=self._worker,
-            args=(path_a, path_b, out_path, ignore_linebreaks, detect_pages, export_docx),
+            args=(path_a, path_b, out_path, ignore_linebreaks, detect_pages, detect_moves, export_docx, len(steps)),
             daemon=True,
         )
         thread.start()
 
-    def _worker(self, path_a, path_b, out_path, ignore_linebreaks, detect_pages, export_docx):
+    def _set_progress(self, i, total, label):
+        self.progress["value"] = i
+        self.progress_label.config(text=f"[{i}/{total}] {label} …")
+
+    def _worker(self, path_a, path_b, out_path, ignore_linebreaks, detect_pages, detect_moves, export_docx, total_steps):
+        step_counter = [0]
+
+        def advance(label):
+            step_counter[0] += 1
+            i = step_counter[0]
+            self.after(0, lambda: self._set_progress(i, total_steps, label))
+
         try:
             chapters_a = extract_chapters(path_a)
+            advance("Dokument A einlesen")
             chapters_b = extract_chapters(path_b)
+            advance("Dokument B einlesen")
 
             if not chapters_a or not chapters_b:
                 self.after(0, lambda: messagebox.showwarning(
@@ -236,50 +275,59 @@ class CompareApp(tk.Tk):
             pages_method = None
             diagnostics = None
             if detect_pages:
-                self.after(0, lambda: self.var_status.set("Preflight-Check Seiten-Gruppierung …"))
                 diagnostics = _core.diagnose_page_detection()
-                self.after(0, lambda: self.var_status.set("Ermittle Seiten (MS Word, sonst LibreOffice) …"))
+                advance("Preflight-Check Seiten-Gruppierung")
                 method = attach_pages(chapters_a, chapters_b, path_a, path_b)
                 pages_method = method if method is not None else "unavailable"
-                self.after(0, lambda: self.var_status.set("Vergleiche Dokumente …"))
+                advance("Seiten ermitteln")
 
             rows = build_comparison(chapters_a, chapters_b, ignore_linebreaks=ignore_linebreaks)
+            advance("Vergleich berechnen")
+
+            moves = None
+            if detect_moves:
+                moves = detect_possible_moves(rows)
+                advance("Verschiebungen erkennen")
+
             stats = compute_stats(chapters_a, chapters_b, rows)
             out_html = render_html(
                 rows, stats, path_a.name, path_b.name, ignore_linebreaks=ignore_linebreaks,
                 meta_a=doc_metadata(path_a), meta_b=doc_metadata(path_b),
-                pages_method=pages_method, diagnostics=diagnostics,
+                pages_method=pages_method, diagnostics=diagnostics, moves=moves,
             )
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text(out_html, encoding="utf-8")
+            advance("Report schreiben")
 
             docx_path = None
             if export_docx:
-                self.after(0, lambda: self.var_status.set("Erzeuge Word-Report …"))
                 docx_path = out_path.with_suffix(".docx")
                 generate_docx_report(
                     rows, stats, path_a.name, path_b.name, docx_path,
                     meta_a=doc_metadata(path_a), meta_b=doc_metadata(path_b),
                 )
+                advance("Word-Report erzeugen")
 
             # Konfiguration fuer naechsten Start merken
             save_config({
                 "doc_a": str(path_a), "doc_b": str(path_b), "out": str(out_path),
                 "ignore_linebreaks": ignore_linebreaks, "detect_pages": detect_pages,
-                "export_docx": export_docx,
+                "detect_moves": detect_moves, "export_docx": export_docx,
             })
 
-            self.after(0, lambda: self._on_success(out_path, stats, docx_path))
+            self.after(0, lambda: self._on_success(out_path, stats, docx_path, len(moves) if moves else 0))
         except Exception as exc:  # noqa: BLE001 - Fehler dem Nutzer anzeigen statt zu verschlucken
             self.after(0, lambda: self._on_error(exc))
 
-    def _on_success(self, out_path, stats, docx_path=None):
-        self.progress.stop()
+    def _on_success(self, out_path, stats, docx_path=None, move_count=0):
         self.btn_compare.config(state="normal")
         status_text = f"Report erstellt: {out_path}"
         if docx_path:
             status_text += f"  |  Word-Report: {docx_path}"
         self.var_status.set(status_text)
+        self.progress_label.config(
+            text=f"Fertig." + (f"  🔀 {move_count} mögliche Verschiebung(en) erkannt." if move_count else "")
+        )
         self.stats_label.config(
             text=(
                 f"Kapitel A: {stats['total_a']}   Kapitel B: {stats['total_b']}   "
@@ -290,9 +338,9 @@ class CompareApp(tk.Tk):
         webbrowser.open(out_path.resolve().as_uri())
 
     def _on_error(self, exc):
-        self.progress.stop()
         self.btn_compare.config(state="normal")
         self.var_status.set("Fehler beim Vergleich.")
+        self.progress_label.config(text="Abgebrochen.")
         messagebox.showerror("Fehler", f"Beim Vergleich ist ein Fehler aufgetreten:\n\n{exc}")
 
 

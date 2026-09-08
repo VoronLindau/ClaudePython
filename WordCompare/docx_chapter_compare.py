@@ -741,6 +741,7 @@ def build_comparison(chapters_a, chapters_b, ignore_linebreaks=True):
                 "images_a": ca.get("images", []), "images_b": cb.get("images", []),
                 "images_changed": images_changed,
                 "page_a": ca.get("page"), "page_b": cb.get("page"),
+                "text_a_raw": ca["text"], "text_b_raw": cb["text"],
             })
         elif ca and not cb:
             deleted_only.append(ca)
@@ -767,6 +768,7 @@ def build_comparison(chapters_a, chapters_b, ignore_linebreaks=True):
             "images_a": ca.get("images", []), "images_b": cb.get("images", []),
             "images_changed": images_changed,
             "page_a": ca.get("page"), "page_b": cb.get("page"),
+            "text_a_raw": ca["text"], "text_b_raw": cb["text"],
         })
         order_a[ca["key"]] = order_a.get(ca["key"], order_a.get(cb["key"], 0))
 
@@ -780,6 +782,7 @@ def build_comparison(chapters_a, chapters_b, ignore_linebreaks=True):
             "images_a": ca.get("images", []), "images_b": [],
             "images_changed": bool(ca.get("images")),
             "page_a": ca.get("page"), "page_b": None,
+            "text_a_raw": ca["text"], "text_b_raw": "",
         })
 
     for cb in new_only:
@@ -792,6 +795,7 @@ def build_comparison(chapters_a, chapters_b, ignore_linebreaks=True):
             "images_a": [], "images_b": cb.get("images", []),
             "images_changed": bool(cb.get("images")),
             "page_a": None, "page_b": cb.get("page"),
+            "text_a_raw": "", "text_b_raw": cb["text"],
         })
 
     def sort_key(row):
@@ -802,6 +806,95 @@ def build_comparison(chapters_a, chapters_b, ignore_linebreaks=True):
 
     rows.sort(key=sort_key)
     return rows
+
+
+# ---------------------------------------------------------------------------
+# Verschiebungs-Erkennung ("moved content")
+# ---------------------------------------------------------------------------
+#
+# Das normale Matching (build_comparison) laeuft strikt ueber die
+# Kapitelnummer. Wandert ein Thema von Kapitel 3.2 (Dokument A) nach Kapitel
+# 5.1 (Dokument B) - und existieren BEIDE Nummern real in beiden Dokumenten -
+# werden das zwei unabhaengige "geaendert"/"neu"-Zeilen, ohne dass ein
+# Zusammenhang erkannt wird (der Fallback-Textvergleich in
+# fallback_match_unnumbered greift nur, wenn eine Seite GAR KEINE echte
+# Nummer hat). Diese Funktion laeuft NACH dem normalen Matching als separate,
+# rein informative Zusatz-Erkennung: sie fasst NICHTS zusammen und aendert
+# keinen Status, sondern haengt Kapiteln, deren verschwundener/neuer
+# Text-Anteil einem anderen Kapitel stark aehnelt, einen Hinweis an.
+
+MOVE_MIN_LEN = 30
+MOVE_THRESHOLD = 0.55
+
+
+def _diff_removed_added(text_a, text_b):
+    """Liefert (entfernter_text, hinzugefuegter_text) als Klartext - die
+    Teile, die beim Wort-Diff als 'delete'/'replace' bzw. 'insert'/'replace'
+    markiert wuerden, hier aber nur als reiner Text fuer den Aehnlichkeits-
+    Abgleich der Verschiebungs-Erkennung."""
+    tokens_a = _tokenize(text_a)
+    tokens_b = _tokenize(text_b)
+    sm = difflib.SequenceMatcher(None, tokens_a, tokens_b, autojunk=False)
+    removed, added = [], []
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag in ("delete", "replace"):
+            removed.append("".join(tokens_a[i1:i2]))
+        if tag in ("insert", "replace"):
+            added.append("".join(tokens_b[j1:j2]))
+    return normalize_whitespace("".join(removed)), normalize_whitespace("".join(added))
+
+
+def detect_possible_moves(rows, min_len=MOVE_MIN_LEN, threshold=MOVE_THRESHOLD):
+    """Sucht nach Kapiteln, deren verschwundener Text-Anteil (aus 'geaendert'
+    oder 'geloescht') einem hinzugekommenen Text-Anteil (aus 'geaendert' oder
+    'neu') eines ANDEREN Kapitels stark aehnelt - ein Indiz dafuer, dass
+    Inhalt zwischen real unterschiedlich nummerierten Kapiteln verschoben
+    wurde. Haengt bei Fund row['moves'] (Liste von Hinweisen) an die
+    betroffenen Zeilen an. Rein informativ - aendert nie den Status oder das
+    Matching selbst. Gibt zusaetzlich die Liste aller gefundenen
+    Verschiebungen zurueck (fuer eine Zusammenfassung im Report)."""
+    row_by_key = {r["key"]: r for r in rows}
+    removed_pool, added_pool = [], []
+
+    for r in rows:
+        status = r["status"]
+        text_a = r.get("text_a_raw", "") or ""
+        text_b = r.get("text_b_raw", "") or ""
+        if status == "deleted":
+            if len(text_a) >= min_len:
+                removed_pool.append((r["key"], r["number"], text_a))
+        elif status == "new":
+            if len(text_b) >= min_len:
+                added_pool.append((r["key"], r["number"], text_b))
+        elif status == "changed":
+            removed_text, added_text = _diff_removed_added(text_a, text_b)
+            if len(removed_text) >= min_len:
+                removed_pool.append((r["key"], r["number"], removed_text))
+            if len(added_text) >= min_len:
+                added_pool.append((r["key"], r["number"], added_text))
+
+    moves = []
+    for rkey, rnum, rtext in removed_pool:
+        best_key, best_num, best_score = None, None, 0.0
+        for akey, anum, atext in added_pool:
+            if akey == rkey:
+                continue
+            score = difflib.SequenceMatcher(None, rtext, atext, autojunk=False).ratio()
+            if score > best_score:
+                best_key, best_num, best_score = akey, anum, score
+        if best_key is not None and best_score >= threshold:
+            moves.append({
+                "from_key": rkey, "from_number": rnum,
+                "to_key": best_key, "to_number": best_num,
+                "score": best_score,
+            })
+            row_by_key[rkey].setdefault("moves", []).append(
+                {"direction": "to", "other_number": best_num, "score": best_score}
+            )
+            row_by_key[best_key].setdefault("moves", []).append(
+                {"direction": "from", "other_number": rnum, "score": best_score}
+            )
+    return moves
 
 
 def compute_stats(chapters_a, chapters_b, rows):
@@ -1091,7 +1184,24 @@ def _page_classes(page, first, last):
     return f" {band} pg-grouped {grp}"
 
 
-def _cell(number, title, body_html, images, side, status, page=None, first_in_group=False, last_in_group=False):
+def _moves_html(moves_list):
+    """Rendert die Verschiebungs-Hinweise eines Kapitels (falls vorhanden)."""
+    if not moves_list:
+        return ""
+    parts = []
+    for m in moves_list:
+        pct = int(m["score"] * 100)
+        arrow = "→" if m["direction"] == "to" else "←"
+        verb = "evtl. verschoben nach" if m["direction"] == "to" else "evtl. hierher verschoben von"
+        parts.append(
+            f'<div class="move-note">🔀 {verb} Kapitel {html.escape(m["other_number"])} '
+            f'({pct}% ähnlich) {arrow}</div>'
+        )
+    return "".join(parts)
+
+
+def _cell(number, title, body_html, images, side, status, page=None, first_in_group=False, last_in_group=False,
+          moves=None):
     page_class = _page_classes(page, first_in_group, last_in_group)
     page_tag = f'<div class="page-tag">📄 Seite {page}</div>' if (page is not None and first_in_group) else ""
 
@@ -1109,6 +1219,7 @@ def _cell(number, title, body_html, images, side, status, page=None, first_in_gr
             f"<summary>{header}</summary>"
             f'<div class="chbody">{body_html}</div>'
             f"{_images_html(images)}"
+            f"{_moves_html(moves)}"
             f"</details>"
         )
     # WICHTIG: pro Grid-Spalte muss genau EIN direktes Kind-Element ans
@@ -1147,7 +1258,7 @@ def _compute_group_flags(page_seq):
 
 
 def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None, meta_b=None,
-                 pages_method=None, diagnostics=None):
+                 pages_method=None, diagnostics=None, moves=None):
     meta_a = meta_a or {"name": name_a, "modified": ""}
     meta_b = meta_b or {"name": name_b, "modified": ""}
 
@@ -1164,10 +1275,13 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
     for idx, r in enumerate(rows):
         status = r["status"]
         page_a, page_b = r.get("page_a"), r.get("page_b")
+        row_moves = r.get("moves", [])
+        left_moves = [m for m in row_moves if m["direction"] == "to"]
+        right_moves = [m for m in row_moves if m["direction"] == "from"]
         left = _cell(r["number"], r["title_a"], r["html_a"], r.get("images_a", []), "left", status,
-                     page=page_a, first_in_group=first_a[idx], last_in_group=last_a[idx])
+                     page=page_a, first_in_group=first_a[idx], last_in_group=last_a[idx], moves=left_moves)
         right = _cell(r["number"], r["title_b"], r["html_b"], r.get("images_b", []), "right", status,
-                       page=page_b, first_in_group=first_b[idx], last_in_group=last_b[idx])
+                       page=page_b, first_in_group=first_b[idx], last_in_group=last_b[idx], moves=right_moves)
         pct = f'{int(r["ratio"] * 100)}%' if status == "changed" else ""
         img_badge = '<span class="conn-img-badge" title="Grafik geändert">🖼</span>' if r.get("images_changed") else ""
         spine_class = " has-page-spine" if (page_a is not None or page_b is not None) else ""
@@ -1185,6 +1299,15 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
           <select id="rs-{safe_id}" class="review-select" onchange="onReviewChange('{safe_id}')">{review_options_html}</select>
           <input type="text" id="rc-{safe_id}" class="review-comment" placeholder="Kommentar…" oninput="onReviewChange('{safe_id}')">
         </div>"""
+        manual_link_box = f"""
+        <div class="manual-link-box" data-link-key="{html.escape(r['key'], quote=True)}">
+          <label for="ml-{safe_id}">🔗 Manuell verknüpfen mit:</label>
+          <input type="text" id="ml-{safe_id}" class="manual-link-input" list="chapter-datalist"
+                 placeholder="Kapitelnummer eingeben…" oninput="onManualLinkChange('{safe_id}')"
+                 autocomplete="off">
+          <button type="button" class="ml-btn" onclick="jumpToManualLink('{safe_id}')" title="Zur verknüpften Zeile springen">↷</button>
+          <button type="button" class="ml-btn ml-clear" onclick="clearManualLink('{safe_id}')" title="Verknüpfung zurücknehmen">✕</button>
+        </div>"""
         # Abstand zur vorherigen Zeile nur einfuegen, wenn mindestens eine
         # Seite hier tatsaechlich eine neue Seiten-Gruppe beginnt - so
         # verschmelzen die Boxen ueber mehrere Zeilen optisch nahtlos.
@@ -1194,6 +1317,7 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
             f'<div class="{wrapper_class}" data-status="{status}">'
             f'<div class="grid-row row-{status}" data-status="{status}">{left}{connector}{right}</div>'
             f"{review_box}"
+            f"{manual_link_box}"
             f"</div>"
         )
 
@@ -1235,11 +1359,28 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
     <ul>{diag_items}</ul>
   </details>"""
 
+    moves_summary_html = ""
+    if moves:
+        move_items = "".join(
+            f"<li>Kapitel {html.escape(m['from_number'])} → Kapitel {html.escape(m['to_number'])} "
+            f"({int(m['score'] * 100)}% ähnlich)</li>"
+            for m in moves
+        )
+        moves_summary_html = f"""
+  <details class="moves-summary" open>
+    <summary>🔀 Mögliche Verschiebungen erkannt ({len(moves)})</summary>
+    <p>Inhalt, der auf einer Seite verschwunden ist, ähnelt stark neuem/geändertem Inhalt in einem
+       anderen Kapitel - ein Indiz für Umsortierung. Rein informativ, ändert nichts am Matching oben.</p>
+    <ul>{move_items}</ul>
+  </details>"""
+
     # Sicher als JS-Objekt-Literale einbetten (json.dumps escaped Anfuehrungszeichen,
     # Backslashes etc. korrekt - kein manuelles String-Basteln noetig).
     doc_meta_json = json.dumps({"a": meta_a, "b": meta_b}, ensure_ascii=False)
     script_version_json = json.dumps(SCRIPT_VERSION)
     review_schema_json = json.dumps(REVIEW_SCHEMA_VERSION)
+    chapter_keys_json = json.dumps({r["key"]: r["number"] for r in rows}, ensure_ascii=False)
+    safe_id_to_key_json = json.dumps({_safe_id(r["key"]): r["key"] for r in rows}, ensure_ascii=False)
 
     return f"""<!DOCTYPE html>
 <html lang="de">
@@ -1367,6 +1508,17 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
     font-size: 11px; color: #92400e; background: #fffbeb; border: 1px dashed #fcd34d;
     border-radius: 4px; padding: 6px 10px; max-width: 220px;
   }}
+  .move-note {{
+    font-size: 11px; color: #6d28d9; background: #f5f3ff; border: 1px solid #ddd6fe;
+    border-radius: 4px; padding: 5px 9px; margin-top: 8px;
+  }}
+  .moves-summary {{
+    margin-top: 8px; font-size: 12px; background: #f5f3ff; border: 1px solid #ddd6fe;
+    border-radius: 6px; padding: 6px 12px; color: #4c1d95;
+  }}
+  .moves-summary summary {{ cursor: pointer; color: #6d28d9; font-weight: 600; }}
+  .moves-summary ul {{ margin: 8px 0 4px 0; padding-left: 20px; }}
+  .moves-summary li {{ margin-bottom: 4px; }}
 
   .row-unchanged .cell-left, .row-unchanged .cell-right {{ border-color: #bbf7d0; }}
   .row-changed .cell-left, .row-changed .cell-right {{ border-color: #fed7aa; }}
@@ -1429,6 +1581,21 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
   .review-box.rv-not_accepted {{ background: #fef2f2; }}
   .review-box.rv-refinement_customer {{ background: #eff6ff; }}
   .review-box.rv-internal_clarification {{ background: #fff7ed; }}
+  .manual-link-box {{
+    display: flex; align-items: center; gap: 8px;
+    background: #fafafa; border: 1px solid var(--border); border-top: none;
+    border-radius: 0 0 6px 6px; padding: 6px 12px; font-size: 12px;
+  }}
+  .manual-link-box label {{ color: #666; white-space: nowrap; }}
+  .manual-link-input {{ flex: 1; font-size: 12px; padding: 4px 8px; border-radius: 4px; border: 1px solid var(--border); }}
+  .manual-link-box.ml-valid {{ background: #eff6ff; }}
+  .manual-link-box.ml-valid .manual-link-input {{ border-color: #2563eb; color: #1d4ed8; }}
+  .manual-link-box.ml-invalid .manual-link-input {{ border-color: #dc2626; color: #b91c1c; }}
+  .ml-btn {{
+    border: 1px solid var(--border); background: #fff; border-radius: 4px;
+    padding: 3px 8px; font-size: 12px; cursor: pointer; color: #444;
+  }}
+  .ml-btn:hover {{ background: #f1f5f9; }}
   .version-line {{ font-size: 11px; color: #888; }}
   .diagnostics-box {{
     margin-top: 8px; font-size: 12px; background: #f8fafc; border: 1px solid var(--border);
@@ -1450,6 +1617,7 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
   <div class="doc-names">ℹ️ {html.escape(linebreak_note)}</div>
   {f'<div class="doc-names">{html.escape(page_note)}</div>' if page_note else ''}
   {diagnostics_html}
+  {moves_summary_html}
   <div class="version-line">Tool-Version {SCRIPT_VERSION} · Review-Schema {REVIEW_SCHEMA_VERSION}</div>
   <div class="stats-bar">{stats_html}</div>
   <div class="toolbar">
@@ -1475,11 +1643,18 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
 <div class="compare-grid" id="grid">
   {''.join(row_html)}
 </div>
+<datalist id="chapter-datalist">
+  {''.join(f'<option value="{html.escape(r["number"], quote=True)}">' for r in rows)}
+</datalist>
 <script>
   const DOC_META = {doc_meta_json};
   const SCRIPT_VERSION = {script_version_json};
   const REVIEW_SCHEMA_VERSION = {review_schema_json};
   const REVIEW_STATUS_VALUES = ['accepted', 'not_accepted', 'refinement_customer', 'internal_clarification'];
+  const CHAPTER_KEYS = {chapter_keys_json};       // key -> Kapitelnummer (fuer Anzeige/Abgleich)
+  const SAFE_ID_TO_KEY = {safe_id_to_key_json};   // safe_id -> key
+  const KEY_TO_SAFE_ID = Object.fromEntries(Object.entries(SAFE_ID_TO_KEY).map(function(e) {{ return [e[1], e[0]]; }}));
+  const MANUAL_LINKS = {{}};  // safe_id -> Ziel-key (nur im Speicher, Persistenz ueber Review-JSON)
 
   const REVIEW_BOXES = {{}};
   document.querySelectorAll('.review-box').forEach(function(box) {{
@@ -1541,6 +1716,46 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
     if (filterMode === 'unreviewed') {{ setFilter('unreviewed'); }}
   }}
 
+  function onManualLinkChange(id) {{
+    const input = document.getElementById('ml-' + id);
+    const box = input.closest('.manual-link-box');
+    const val = input.value.trim();
+    const ownKey = SAFE_ID_TO_KEY[id];
+    box.classList.remove('ml-valid', 'ml-invalid');
+    if (!val) {{
+      delete MANUAL_LINKS[id];
+      return;
+    }}
+    const foundKey = Object.keys(CHAPTER_KEYS).find(function(k) {{
+      return CHAPTER_KEYS[k] === val && k !== ownKey;
+    }});
+    if (foundKey) {{
+      MANUAL_LINKS[id] = foundKey;
+      box.classList.add('ml-valid');
+    }} else {{
+      delete MANUAL_LINKS[id];
+      box.classList.add('ml-invalid');
+    }}
+  }}
+
+  function clearManualLink(id) {{
+    const input = document.getElementById('ml-' + id);
+    input.value = '';
+    onManualLinkChange(id);
+  }}
+
+  function jumpToManualLink(id) {{
+    const targetKey = MANUAL_LINKS[id];
+    if (!targetKey) {{ return; }}
+    const box = REVIEW_BOXES[targetKey];
+    const row = box ? box.closest('.row-wrapper') : null;
+    if (!row) {{ return; }}
+    row.scrollIntoView({{behavior: 'smooth', block: 'center'}});
+    row.classList.remove('delta-flash');
+    void row.offsetWidth;
+    row.classList.add('delta-flash');
+  }}
+
   function collectReviews() {{
     const result = {{}};
     Object.keys(REVIEW_BOXES).forEach(function(key) {{
@@ -1550,6 +1765,16 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
       if (status || comment) {{
         result[key] = {{status: status, comment: comment}};
       }}
+    }});
+    return result;
+  }}
+
+  function collectManualLinks() {{
+    const result = {{}};
+    Object.keys(MANUAL_LINKS).forEach(function(safeId) {{
+      const ownKey = SAFE_ID_TO_KEY[safeId];
+      const targetKey = MANUAL_LINKS[safeId];
+      if (ownKey && targetKey) {{ result[ownKey] = targetKey; }}
     }});
     return result;
   }}
@@ -1564,7 +1789,8 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
       generated_by: 'docx_chapter_compare.py v' + SCRIPT_VERSION,
       doc_a: DOC_META.a,
       doc_b: DOC_META.b,
-      reviews: collectReviews()
+      reviews: collectReviews(),
+      manual_moves: collectManualLinks()
     }};
     const blob = new Blob([JSON.stringify(data, null, 2)], {{type: 'application/json'}});
     const url = URL.createObjectURL(blob);
@@ -1607,6 +1833,19 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
       matched++;
     }});
 
+    const manualMoves = data.manual_moves || {{}};
+    let linkMatched = 0, linkUnmatched = 0;
+    Object.keys(manualMoves).forEach(function(ownKey) {{
+      const targetKey = manualMoves[ownKey];
+      const safeId = KEY_TO_SAFE_ID[ownKey];
+      const input = safeId ? document.getElementById('ml-' + safeId) : null;
+      const targetNumber = CHAPTER_KEYS[targetKey];
+      if (!input || !targetNumber) {{ linkUnmatched++; return; }}
+      input.value = targetNumber;
+      onManualLinkChange(safeId);
+      linkMatched++;
+    }});
+
     const warnBox = document.getElementById('review-import-warning');
     const da = data.doc_a || {{}}, db = data.doc_b || {{}};
     let warnings = [];
@@ -1625,13 +1864,16 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
     if (unmatched > 0) {{
       warnings.push(unmatched + ' Kapitel aus der JSON-Datei wurden im aktuellen Report nicht gefunden (evtl. andere Kapitelstruktur) und übersprungen.');
     }}
+    if (linkUnmatched > 0) {{
+      warnings.push(linkUnmatched + ' manuelle Verknüpfung(en) konnten nicht wiederhergestellt werden (Kapitel nicht mehr vorhanden).');
+    }}
     if (warnings.length) {{
       warnBox.textContent = '⚠ ' + warnings.join('\\n⚠ ');
       warnBox.style.display = 'block';
     }} else {{
       warnBox.style.display = 'none';
     }}
-    alert('Review importiert: ' + matched + ' Kapitel übernommen.' + (warnings.length ? ' Siehe Hinweis oben.' : ''));
+    alert('Review importiert: ' + matched + ' Kapitel übernommen, ' + linkMatched + ' manuelle Verknüpfung(en) wiederhergestellt.' + (warnings.length ? ' Siehe Hinweis oben.' : ''));
   }}
 </script>
 </body>
@@ -1744,6 +1986,10 @@ def main():
              "LibreOffice (soffice) gefunden wird.",
     )
     parser.add_argument(
+        "--no-moves", action="store_true",
+        help="Erkennung moeglicher Kapitel-Verschiebungen abschalten. Standard: an.",
+    )
+    parser.add_argument(
         "--soffice-path", default=None,
         help="Expliziter Pfad zu soffice/soffice.exe, falls automatische Suche fehlschlaegt.",
     )
@@ -1812,11 +2058,16 @@ def main():
 
     rows = build_comparison(chapters_a, chapters_b, ignore_linebreaks=ignore_linebreaks)
     stats = compute_stats(chapters_a, chapters_b, rows)
+    moves = None
+    if not args.no_moves:
+        moves = detect_possible_moves(rows)
+        if moves:
+            print(f"Mögliche Verschiebungen erkannt: {len(moves)} (siehe Report für Details)")
 
     out_html = render_html(
         rows, stats, path_a.name, path_b.name, ignore_linebreaks=ignore_linebreaks,
         meta_a=doc_metadata(path_a), meta_b=doc_metadata(path_b),
-        pages_method=pages_method, diagnostics=diagnostics,
+        pages_method=pages_method, diagnostics=diagnostics, moves=moves,
     )
     out_path = Path(args.output)
     out_path.write_text(out_html, encoding="utf-8")

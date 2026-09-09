@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """
 docx_chapter_compare.py
-Version 2.6 / 2026-09-05 / Grund: Bugfix - Bilder wurden VOR der
-    Kapitel-Klassifizierung des jeweiligen Absatzes angehaengt. Enthielt ein
-    Absatz gleichzeitig eine neue (formatvorlagen-numerierte) Ueberschrift
-    UND ein Bild, landete das Bild faelschlich in einem soeben dafuer
-    erzeugten Fallback-Kapitel ("_N") statt im tatsaechlichen Kapitel - und
-    Fallback-Kapitel werden ans Ende sortiert, wodurch das Bild optisch an
-    der falschen Stelle (ganz am Schluss) auftauchte. Bilder werden jetzt
-    NACH der Klassifizierung angehaengt, landen also im jeweils gerade
-    bestimmten/erzeugten Kapitel.
+Version 2.7 / 2026-09-05 / Grund: Neuer Diagnose-Report-Modus
+    (--diagnostic-report) fuer die Fehlersuche bei langsamen/haengenden
+    Laeufen auf sensiblen Dokumenten - laeuft die Pipeline mit Zeitmessung
+    und Timeout je Schritt (via Hilfs-Thread, blockiert den Diagnose-Lauf
+    selbst nicht dauerhaft), Report enthaelt AUSSCHLIESSLICH Zahlen
+    (Absatz-/Kapitelanzahl, Textlaengen, Zeitdauern, Umgebungsinfo) - NIE
+    den Kapitel-/Anforderungstext. Hintergrund: fallback_match_unnumbered
+    und detect_possible_moves sind beide O(n^2) in der Anzahl unmatched/
+    geaenderter Kapitel - bei vielen Aenderungen auf grossen Dokumenten kann
+    das sehr lange dauern und wie ein Haenger wirken.
 
 Vergleicht zwei Word-Dokumente (.docx) auf Basis von Kapitelnummern als
 Fixpunkten und erzeugt einen eigenstaendigen HTML-Report:
@@ -44,6 +45,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import zipfile
 from datetime import datetime
 from pathlib import Path
@@ -55,7 +58,7 @@ from docx.oxml.ns import qn
 from docx.shared import Pt, RGBColor, Twips
 from lxml import etree
 
-SCRIPT_VERSION = "2.6"
+SCRIPT_VERSION = "2.7"
 REVIEW_SCHEMA_VERSION = "1.0"
 
 REVIEW_STATUS_OPTIONS = [
@@ -241,7 +244,7 @@ def extract_chapters(docx_path):
     fallback_counter = 0
     current_para_idx = -1
 
-    def new_chapter(number):
+    def new_chapter(number, source="fallback"):
         nonlocal current, fallback_counter
         if number is None:
             fallback_counter += 1
@@ -249,8 +252,10 @@ def extract_chapters(docx_path):
         # first_para_index merkt sich, an welchem Word-Absatz (0-basiert)
         # dieses Kapitel beginnt - wird fuer die exakte Seiten-Abfrage per
         # MS-Word-COM-Automation gebraucht (siehe attach_pages).
+        # "source" ist NUR Diagnose-Metadatum (welches Muster hat das Kapitel
+        # erzeugt) - enthaelt nie Inhalt, siehe generate_diagnostic_report().
         current = {"number": number, "title": "", "paragraphs": [], "images": [],
-                   "first_para_index": current_para_idx}
+                   "first_para_index": current_para_idx, "_source": source}
         chapters.append(current)
 
     def append_text(text):
@@ -289,7 +294,7 @@ def extract_chapters(docx_path):
         auto_number = numberer.number_for_style(_style_id(para))
         if auto_number is not None:
             pending_numbers.clear()
-            new_chapter(auto_number)
+            new_chapter(auto_number, source="heading_auto")
             if text:
                 append_text(text)
         elif not text:
@@ -301,18 +306,18 @@ def extract_chapters(docx_path):
 
             if m_tab:
                 pending_numbers.clear()
-                new_chapter(m_tab.group(1))
+                new_chapter(m_tab.group(1), source="tab_anchor")
                 append_text(m_tab.group(2))
             elif m_dot and pending_numbers:
                 base = pending_numbers.pop(0)
-                new_chapter(f"{base}.{m_dot.group(1)}")
+                new_chapter(f"{base}.{m_dot.group(1)}", source="dot_continuation")
                 append_text(m_dot.group(2))
             elif m_bare:
                 pending_numbers.append(m_bare.group(1))
             elif pending_numbers:
                 number = pending_numbers.pop(0)
                 pending_numbers.clear()  # uebrige Duplikate/Reste verwerfen
-                new_chapter(number)
+                new_chapter(number, source="bare_fallback")
                 append_text(text)
             else:
                 append_text(text)
@@ -656,7 +661,7 @@ def _similarity(a, b):
     return difflib.SequenceMatcher(None, a, b, autojunk=False).ratio()
 
 
-def fallback_match_unnumbered(deleted_only, new_only, threshold=0.6):
+def fallback_match_unnumbered(deleted_only, new_only, threshold=0.6, time_budget_s=5.0):
     """Versucht, Kapitel ohne (uebereinstimmende) Nummer per Text-/Titel-
     Aehnlichkeit einander zuzuordnen. Das faengt Faelle ab, in denen eine
     Kapitelnummer in einer der beiden Exportversionen komplett fehlt (echter
@@ -667,18 +672,35 @@ def fallback_match_unnumbered(deleted_only, new_only, threshold=0.6):
     nur echte Fallback-Keys ("_1", "_2", ...). Sonst werden bei stark
     fragmentierten Dokumenten faelschlich inhaltlich unpassende Kapitel
     zusammengeklebt, nur weil beide Seiten "uebrig" waren.
-    """
+
+    Wie detect_possible_moves() ist der Kern O(n*m) - bei sehr vielen
+    unnumerierten Kapiteln (untypisch, aber moeglich bei stark fragmentierten
+    Exporten) mit denselben zwei Absicherungen versehen: billiger Laengen-
+    Vorfilter + SequenceMatcher.quick_ratio() vor dem teuren ratio(), und ein
+    hartes Zeitbudget (bricht sauber ab statt zu haengen - liefert dann ein
+    Teilergebnis statt eines vollstaendigen)."""
     candidates_a = [c for c in deleted_only if c["number"].startswith("_")]
     candidates_b = [c for c in new_only if c["number"].startswith("_")]
 
     pairs = []
     used_b_keys = set()
+    start = time.perf_counter()
     for ca in candidates_a:
+        if time.perf_counter() - start > time_budget_s:
+            break
         best, best_score = None, 0.0
+        ca_title, ca_text = ca["title"], ca["text"]
+        ca_len = len(ca_text)
         for cb in candidates_b:
             if cb["key"] in used_b_keys:
                 continue
-            score = max(_similarity(ca["title"], cb["title"]), _similarity(ca["text"], cb["text"]))
+            score = _similarity(ca_title, cb["title"])
+            cb_text = cb["text"]
+            total_len = ca_len + len(cb_text)
+            if total_len and (2 * min(ca_len, len(cb_text)) / total_len) >= threshold:
+                sm = difflib.SequenceMatcher(None, ca_text, cb_text, autojunk=False)
+                if sm.quick_ratio() >= threshold:
+                    score = max(score, sm.ratio())
             if score > best_score:
                 best_score, best = score, cb
         if best is not None and best_score >= threshold:
@@ -844,15 +866,29 @@ def _diff_removed_added(text_a, text_b):
     return normalize_whitespace("".join(removed)), normalize_whitespace("".join(added))
 
 
-def detect_possible_moves(rows, min_len=MOVE_MIN_LEN, threshold=MOVE_THRESHOLD):
+def detect_possible_moves(rows, min_len=MOVE_MIN_LEN, threshold=MOVE_THRESHOLD, time_budget_s=8.0):
     """Sucht nach Kapiteln, deren verschwundener Text-Anteil (aus 'geaendert'
     oder 'geloescht') einem hinzugekommenen Text-Anteil (aus 'geaendert' oder
     'neu') eines ANDEREN Kapitels stark aehnelt - ein Indiz dafuer, dass
     Inhalt zwischen real unterschiedlich nummerierten Kapiteln verschoben
     wurde. Haengt bei Fund row['moves'] (Liste von Hinweisen) an die
     betroffenen Zeilen an. Rein informativ - aendert nie den Status oder das
-    Matching selbst. Gibt zusaetzlich die Liste aller gefundenen
-    Verschiebungen zurueck (fuer eine Zusammenfassung im Report)."""
+    Matching selbst.
+
+    Der Kern ist O(n*m) in der Anzahl geaenderter/neuer/geloeschter Kapitel -
+    bei sehr vielen Aenderungen auf grossen Dokumenten kann das ohne
+    Schutzmassnahmen sehr lange dauern (fuehlt sich dann wie ein Haenger an,
+    ist aber "nur" sehr langsam). Deshalb zwei Sicherungen: (1) ein billiger
+    Laengen-Vorfilter + SequenceMatcher.quick_ratio() (viel billiger als das
+    eigentliche ratio()) schliesst die meisten Kandidatenpaare aus, bevor der
+    teure Vergleich ueberhaupt laeuft; (2) ein hartes Zeitbudget
+    (time_budget_s) bricht sauber ab statt zu haengen, falls trotzdem zu
+    viele Kandidaten uebrig bleiben (z.B. bei kurzem, sich stark
+    aehnelndem Text).
+
+    Gibt (moves, complete) zurueck - complete=False bedeutet: Zeitbudget
+    ausgeschoepft, Ergebnis ist ein Teilergebnis (was bis dahin gefunden
+    wurde), nicht vollstaendig."""
     row_by_key = {r["key"]: r for r in rows}
     removed_pool, added_pool = [], []
 
@@ -873,13 +909,31 @@ def detect_possible_moves(rows, min_len=MOVE_MIN_LEN, threshold=MOVE_THRESHOLD):
             if len(added_text) >= min_len:
                 added_pool.append((r["key"], r["number"], added_text))
 
+    added_pool_len = [(akey, anum, atext, len(atext)) for akey, anum, atext in added_pool]
+
     moves = []
+    complete = True
+    start = time.perf_counter()
     for rkey, rnum, rtext in removed_pool:
+        if time.perf_counter() - start > time_budget_s:
+            complete = False
+            break
+        rlen = len(rtext)
         best_key, best_num, best_score = None, None, 0.0
-        for akey, anum, atext in added_pool:
+        for akey, anum, atext, alen in added_pool_len:
             if akey == rkey:
                 continue
-            score = difflib.SequenceMatcher(None, rtext, atext, autojunk=False).ratio()
+            # Billiger Vorfilter: die maximal erreichbare ratio() ist durch
+            # die Laengen bereits nach oben begrenzt (2*min(len)/(lenA+lenB)) -
+            # liegt das schon unter der Schwelle, lohnt sich der teure
+            # Vergleich gar nicht erst.
+            total_len = rlen + alen
+            if total_len == 0 or (2 * min(rlen, alen) / total_len) < threshold:
+                continue
+            sm = difflib.SequenceMatcher(None, rtext, atext, autojunk=False)
+            if sm.quick_ratio() < threshold or sm.quick_ratio() <= best_score:
+                continue
+            score = sm.ratio()
             if score > best_score:
                 best_key, best_num, best_score = akey, anum, score
         if best_key is not None and best_score >= threshold:
@@ -894,7 +948,7 @@ def detect_possible_moves(rows, min_len=MOVE_MIN_LEN, threshold=MOVE_THRESHOLD):
             row_by_key[best_key].setdefault("moves", []).append(
                 {"direction": "from", "other_number": rnum, "score": best_score}
             )
-    return moves
+    return moves, complete
 
 
 def compute_stats(chapters_a, chapters_b, rows):
@@ -1258,7 +1312,7 @@ def _compute_group_flags(page_seq):
 
 
 def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None, meta_b=None,
-                 pages_method=None, diagnostics=None, moves=None):
+                 pages_method=None, diagnostics=None, moves=None, moves_complete=True):
     meta_a = meta_a or {"name": name_a, "modified": ""}
     meta_b = meta_b or {"name": name_b, "modified": ""}
 
@@ -1366,12 +1420,26 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
             f"({int(m['score'] * 100)}% ähnlich)</li>"
             for m in moves
         )
+        incomplete_note = (
+            "<p style=\"color:#b45309;\">⚠ Zeitbudget ausgeschöpft - diese Liste ist "
+            "unvollständig, es wurden nicht alle Kapitel-Paare geprüft.</p>"
+            if not moves_complete else ""
+        )
         moves_summary_html = f"""
   <details class="moves-summary" open>
     <summary>🔀 Mögliche Verschiebungen erkannt ({len(moves)})</summary>
     <p>Inhalt, der auf einer Seite verschwunden ist, ähnelt stark neuem/geändertem Inhalt in einem
        anderen Kapitel - ein Indiz für Umsortierung. Rein informativ, ändert nichts am Matching oben.</p>
+    {incomplete_note}
     <ul>{move_items}</ul>
+  </details>"""
+    elif moves is not None and not moves_complete:
+        moves_summary_html = """
+  <details class="moves-summary" open>
+    <summary>🔀 Verschiebungs-Erkennung unvollständig</summary>
+    <p style="color:#b45309;">⚠ Zeitbudget ausgeschöpft, bevor alle Kapitel-Paare geprüft werden
+       konnten (sehr viele Änderungen). Kein Ergebnis in der verfügbaren Zeit gefunden - das
+       heißt nicht zwingend, dass es keine Verschiebungen gibt.</p>
   </details>"""
 
     # Sicher als JS-Objekt-Literale einbetten (json.dumps escaped Anfuehrungszeichen,
@@ -1882,6 +1950,204 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
 
 
 # ---------------------------------------------------------------------------
+# Diagnose-Report ("stuck"/langsame Laeufe analysieren, OHNE Inhalt)
+# ---------------------------------------------------------------------------
+#
+# Fuer Faelle wie "bei 200 Seiten bleibt das Tool haengen": laeuft die
+# komplette Pipeline mit Zeitmessung pro Schritt UND Timeout pro Schritt
+# (per Hilfs-Thread - eine haengende Funktion blockiert den Hauptthread des
+# Diagnose-Laufs nicht, der Report wird trotzdem fertig, markiert den
+# betroffenen Schritt aber als 'timeout'). Der Report enthaelt AUSSCHLIESSLICH
+# Zahlen (Absatz-/Kapitelanzahlen, Textlaengen, Zeitdauern) und
+# Umgebungsinfo - NIE den eigentlichen Kapitel-/Anforderungstext. Damit kann
+# ein Performance-Problem analysiert werden, ohne dass Verschlusssachen-Inhalt
+# die eigene Maschine verlassen muss.
+
+def _run_with_timeout(func, timeout, *args, **kwargs):
+    """Fuehrt func in einem Hilfs-Thread aus und wartet hoechstens 'timeout'
+    Sekunden. Liefert (status, result, duration, error) - status ist 'ok',
+    'timeout' oder 'error'. Bei 'timeout' laeuft der Hilfs-Thread als Daemon
+    im Hintergrund weiter (wird beim Prozessende automatisch beendet), der
+    Diagnose-Lauf selbst blockiert dadurch aber nicht dauerhaft."""
+    result_box = {}
+
+    def runner():
+        start = time.perf_counter()
+        try:
+            result_box["result"] = func(*args, **kwargs)
+            result_box["status"] = "ok"
+        except Exception as exc:
+            result_box["status"] = "error"
+            result_box["error"] = f"{type(exc).__name__}: {exc}"
+        result_box["duration"] = time.perf_counter() - start
+
+    start = time.perf_counter()
+    t = threading.Thread(target=runner, daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        return "timeout", None, time.perf_counter() - start, f"Kein Ergebnis nach {timeout}s"
+    return (
+        result_box.get("status", "error"),
+        result_box.get("result"),
+        result_box.get("duration", time.perf_counter() - start),
+        result_box.get("error"),
+    )
+
+
+def _text_len_stats(chapters):
+    """Reine Laengen-Statistik ueber Kapiteltexte - NIE der Text selbst."""
+    lengths = [len(ch.get("text", "")) for ch in chapters]
+    if not lengths:
+        return {"count": 0}
+    return {
+        "count": len(lengths),
+        "min_chars": min(lengths),
+        "max_chars": max(lengths),
+        "avg_chars": round(sum(lengths) / len(lengths), 1),
+        "total_chars": sum(lengths),
+    }
+
+
+def _source_breakdown(chapters):
+    counts = {}
+    for ch in chapters:
+        src = ch.get("_source", "unknown")
+        counts[src] = counts.get(src, 0) + 1
+    return counts
+
+
+def generate_diagnostic_report(path_a, path_b, output_path, step_timeout=90,
+                                ignore_linebreaks=True, run_pages=False, run_moves=True):
+    """Erzeugt einen JSON-Diagnose-Report OHNE jeglichen Requirement-/
+    Kapiteltext - nur Zahlen, Zeitdauern und Umgebungsinfo. Fuer die
+    Fehlersuche bei langsamen/haengenden Laeufen auf sensiblen Dokumenten,
+    die das eigene Netz nicht verlassen duerfen."""
+    report = {
+        "report_version": "1.0",
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "script_version": SCRIPT_VERSION,
+        "environment": {
+            "python_version": sys.version.split()[0],
+            "platform": sys.platform,
+            "pywin32_available": find_word_com(),
+            "pdfplumber_available": _pdfplumber_available(),
+            "soffice_path": find_soffice(),
+        },
+        "settings": {
+            "ignore_linebreaks": ignore_linebreaks,
+            "run_pages": run_pages,
+            "run_moves": run_moves,
+            "step_timeout_s": step_timeout,
+        },
+        "steps": {},
+    }
+
+    def doc_basic_info(path):
+        p = Path(path)
+        try:
+            size = p.stat().st_size
+        except OSError:
+            size = None
+        info = {"size_bytes": size}
+        try:
+            d = Document(path)
+            info["paragraph_count"] = len(d.paragraphs)
+            style_counts = {}
+            for para in d.paragraphs:
+                sid = para.style.style_id if para.style else "?"
+                style_counts[sid] = style_counts.get(sid, 0) + 1
+            info["style_counts"] = style_counts
+        except Exception as exc:
+            info["error"] = f"{type(exc).__name__}: {exc}"
+        return info
+
+    chapters_a = chapters_b = None
+    for label, path, key in (("doc_a", path_a, "chapters_a"), ("doc_b", path_b, "chapters_b")):
+        basic = doc_basic_info(path)
+        status, result, duration, error = _run_with_timeout(extract_chapters, step_timeout, path)
+        step_report = {"basic_info": basic, "status": status, "duration_s": round(duration, 2)}
+        if status == "ok":
+            step_report["chapter_count"] = len(result)
+            step_report["text_len_stats"] = _text_len_stats(result)
+            step_report["number_source_breakdown"] = _source_breakdown(result)
+            step_report["image_count_total"] = sum(len(ch.get("images", [])) for ch in result)
+            if key == "chapters_a":
+                chapters_a = result
+            else:
+                chapters_b = result
+        else:
+            step_report["error"] = error
+        report["steps"][label] = step_report
+
+    if chapters_a is None or chapters_b is None:
+        report["steps"]["aborted"] = "Kapitel-Extraktion fuer mindestens ein Dokument fehlgeschlagen/Timeout - weitere Schritte übersprungen."
+        report_path = Path(output_path)
+        report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+        return report_path
+
+    if run_pages:
+        status, _, duration, error = _run_with_timeout(
+            attach_pages, step_timeout, chapters_a, chapters_b, path_a, path_b
+        )
+        report["steps"]["attach_pages"] = {"status": status, "duration_s": round(duration, 2), "error": error}
+
+    status, rows, duration, error = _run_with_timeout(
+        build_comparison, step_timeout, chapters_a, chapters_b, ignore_linebreaks
+    )
+    build_step = {"status": status, "duration_s": round(duration, 2)}
+    if status == "ok":
+        stats = compute_stats(chapters_a, chapters_b, rows)
+        build_step.update({
+            "unchanged": stats["unchanged"], "changed": stats["changed"],
+            "new": stats["new"], "deleted": stats["deleted"],
+            "fallback_candidates_a": sum(1 for ch in chapters_a if ch["number"].startswith("_")),
+            "fallback_candidates_b": sum(1 for ch in chapters_b if ch["number"].startswith("_")),
+        })
+    else:
+        build_step["error"] = error
+    report["steps"]["build_comparison"] = build_step
+
+    if run_moves and status == "ok":
+        removed_candidates = sum(1 for r in rows if r["status"] in ("changed", "deleted"))
+        added_candidates = sum(1 for r in rows if r["status"] in ("changed", "new"))
+        mstatus, mresult, mduration, merror = _run_with_timeout(detect_possible_moves, step_timeout, rows)
+        moves, moves_complete = (mresult if mresult is not None else (None, None))
+        report["steps"]["detect_possible_moves"] = {
+            "status": mstatus, "duration_s": round(mduration, 2),
+            "removed_candidate_rows": removed_candidates,
+            "added_candidate_rows": added_candidates,
+            "worst_case_comparisons": removed_candidates * added_candidates,
+            "moves_found": len(moves) if mstatus == "ok" and moves is not None else None,
+            "internal_time_budget_exhausted": (moves_complete is False),
+            "error": merror,
+        }
+
+    if status == "ok":
+        rstatus, out_html, rduration, rerror = _run_with_timeout(
+            render_html, step_timeout, rows, compute_stats(chapters_a, chapters_b, rows),
+            Path(path_a).name, Path(path_b).name,
+        )
+        report["steps"]["render_html"] = {
+            "status": rstatus, "duration_s": round(rduration, 2),
+            "output_size_bytes": len(out_html) if rstatus == "ok" else None,
+            "error": rerror,
+        }
+
+    report_path = Path(output_path)
+    report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    return report_path
+
+
+def _pdfplumber_available():
+    try:
+        import pdfplumber  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -2009,6 +2275,18 @@ def main():
         help="Zuvor per 'Review exportieren' gespeicherte JSON-Datei einlesen und die "
              "Bewertungen (Status/Kommentar) in den Word-Report mit aufnehmen.",
     )
+    parser.add_argument(
+        "--diagnostic-report", nargs="?", const="", default=None, metavar="PFAD",
+        help="Statt eines normalen Vergleichs einen Diagnose-Report (JSON) erzeugen: "
+             "Zeitdauer je Verarbeitungsschritt + Struktur-Kennzahlen (Absatz-/Kapitelanzahl, "
+             "Textlaengen, etc.) - ENTHAELT NIE den Kapitel-/Anforderungstext selbst. Fuer die "
+             "Fehlersuche bei langsamen/haengenden Laeufen auf Dokumenten, die nicht "
+             "weitergegeben werden duerfen. Ohne PFAD wird 'diagnose_report.json' verwendet.",
+    )
+    parser.add_argument(
+        "--diagnostic-step-timeout", type=int, default=90, metavar="SEKUNDEN",
+        help="Timeout je Schritt im Diagnose-Report-Modus (Standard: 90s).",
+    )
     args = parser.parse_args()
 
     if args.diagnose_pages:
@@ -2019,6 +2297,25 @@ def main():
 
     if not args.doc_a or not args.doc_b:
         parser.error("doc_a und doc_b sind erforderlich (ausser bei --diagnose-pages).")
+
+    if args.diagnostic_report is not None:
+        path_a, path_b = Path(args.doc_a), Path(args.doc_b)
+        for p in (path_a, path_b):
+            if not p.exists():
+                print(f"Datei nicht gefunden: {p}", file=sys.stderr)
+                sys.exit(1)
+        out_path = Path(args.diagnostic_report or "diagnose_report.json")
+        print(f"Erzeuge Diagnose-Report (Schritt-Timeout: {args.diagnostic_step_timeout}s) ...")
+        print("Enthaelt AUSSCHLIESSLICH Zahlen/Zeitdauern, nie den Kapitel-/Anforderungstext.")
+        report_path = generate_diagnostic_report(
+            path_a, path_b, out_path,
+            step_timeout=args.diagnostic_step_timeout,
+            ignore_linebreaks=not args.keep_linebreaks,
+            run_pages=not args.no_pages, run_moves=not args.no_moves,
+        )
+        print(f"Diagnose-Report geschrieben: {report_path.resolve()}")
+        print("Diese Datei kann gefahrlos weitergegeben werden (keine Inhalte enthalten).")
+        sys.exit(0)
 
     ignore_linebreaks = not args.keep_linebreaks
 
@@ -2059,15 +2356,20 @@ def main():
     rows = build_comparison(chapters_a, chapters_b, ignore_linebreaks=ignore_linebreaks)
     stats = compute_stats(chapters_a, chapters_b, rows)
     moves = None
+    moves_complete = True
     if not args.no_moves:
-        moves = detect_possible_moves(rows)
+        print("Suche mögliche Verschiebungen (Zeitbudget 8s) ...")
+        moves, moves_complete = detect_possible_moves(rows)
         if moves:
             print(f"Mögliche Verschiebungen erkannt: {len(moves)} (siehe Report für Details)")
+        if not moves_complete:
+            print("Hinweis: Zeitbudget für Verschiebungs-Erkennung ausgeschöpft - "
+                  "Ergebnis ist unvollständig (siehe Hinweis im Report).", file=sys.stderr)
 
     out_html = render_html(
         rows, stats, path_a.name, path_b.name, ignore_linebreaks=ignore_linebreaks,
         meta_a=doc_metadata(path_a), meta_b=doc_metadata(path_b),
-        pages_method=pages_method, diagnostics=diagnostics, moves=moves,
+        pages_method=pages_method, diagnostics=diagnostics, moves=moves, moves_complete=moves_complete,
     )
     out_path = Path(args.output)
     out_path.write_text(out_html, encoding="utf-8")

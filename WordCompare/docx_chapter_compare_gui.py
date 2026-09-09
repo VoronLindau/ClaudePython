@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
 docx_chapter_compare_gui.py
-Version 1.8 / 2026-09-05 / Grund: Echte (determinate) Fortschrittsanzeige
-    statt nur "laeuft/laeuft nicht" - zeigt Schritt X von Y mit Klartext-
-    Label (z.B. "[3/6] Seiten ermitteln..."), Gesamtzahl haengt von den
-    aktivierten Optionen ab. Neue Checkbox "Moegliche Kapitel-Verschiebungen
-    erkennen" (Standard: an) zum Ein-/Ausschalten von detect_possible_moves.
+Version 1.9 / 2026-09-05 / Grund: detect_possible_moves() liefert jetzt
+    (moves, complete) statt nur moves (siehe docx_chapter_compare.py v2.7,
+    Zeitbudget-Schutz gegen sehr lange Laufzeiten bei vielen Aenderungen) -
+    GUI angepasst, zeigt Warnhinweis bei unvollstaendiger Erkennung.
 
 Desktop-GUI (Tkinter, keine Zusatz-Installation noetig) fuer den
 Kapitelvergleich zweier Word-Dokumente. Nutzt dieselbe Vergleichslogik und
@@ -29,7 +28,7 @@ import webbrowser
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-GUI_VERSION = "1.8"
+GUI_VERSION = "1.9"
 
 try:
     import docx_chapter_compare as _core
@@ -285,15 +284,16 @@ class CompareApp(tk.Tk):
             advance("Vergleich berechnen")
 
             moves = None
+            moves_complete = True
             if detect_moves:
-                moves = detect_possible_moves(rows)
+                moves, moves_complete = detect_possible_moves(rows)
                 advance("Verschiebungen erkennen")
 
             stats = compute_stats(chapters_a, chapters_b, rows)
             out_html = render_html(
                 rows, stats, path_a.name, path_b.name, ignore_linebreaks=ignore_linebreaks,
                 meta_a=doc_metadata(path_a), meta_b=doc_metadata(path_b),
-                pages_method=pages_method, diagnostics=diagnostics, moves=moves,
+                pages_method=pages_method, diagnostics=diagnostics, moves=moves, moves_complete=moves_complete,
             )
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text(out_html, encoding="utf-8")
@@ -315,19 +315,23 @@ class CompareApp(tk.Tk):
                 "detect_moves": detect_moves, "export_docx": export_docx,
             })
 
-            self.after(0, lambda: self._on_success(out_path, stats, docx_path, len(moves) if moves else 0))
+            self.after(0, lambda: self._on_success(out_path, stats, docx_path,
+                                                     len(moves) if moves else 0, moves_complete))
         except Exception as exc:  # noqa: BLE001 - Fehler dem Nutzer anzeigen statt zu verschlucken
             self.after(0, lambda: self._on_error(exc))
 
-    def _on_success(self, out_path, stats, docx_path=None, move_count=0):
+    def _on_success(self, out_path, stats, docx_path=None, move_count=0, moves_complete=True):
         self.btn_compare.config(state="normal")
         status_text = f"Report erstellt: {out_path}"
         if docx_path:
             status_text += f"  |  Word-Report: {docx_path}"
         self.var_status.set(status_text)
-        self.progress_label.config(
-            text=f"Fertig." + (f"  🔀 {move_count} mögliche Verschiebung(en) erkannt." if move_count else "")
-        )
+        move_note = ""
+        if move_count:
+            move_note = f"  🔀 {move_count} mögliche Verschiebung(en) erkannt."
+        if not moves_complete:
+            move_note += "  ⚠ Verschiebungs-Erkennung wegen Zeitbudget unvollständig."
+        self.progress_label.config(text="Fertig." + move_note)
         self.stats_label.config(
             text=(
                 f"Kapitel A: {stats['total_a']}   Kapitel B: {stats['total_b']}   "

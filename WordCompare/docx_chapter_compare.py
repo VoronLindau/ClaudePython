@@ -1,16 +1,13 @@
 #!/usr/bin/env python3
 """
 docx_chapter_compare.py
-Version 2.7 / 2026-09-05 / Grund: Neuer Diagnose-Report-Modus
-    (--diagnostic-report) fuer die Fehlersuche bei langsamen/haengenden
-    Laeufen auf sensiblen Dokumenten - laeuft die Pipeline mit Zeitmessung
-    und Timeout je Schritt (via Hilfs-Thread, blockiert den Diagnose-Lauf
-    selbst nicht dauerhaft), Report enthaelt AUSSCHLIESSLICH Zahlen
-    (Absatz-/Kapitelanzahl, Textlaengen, Zeitdauern, Umgebungsinfo) - NIE
-    den Kapitel-/Anforderungstext. Hintergrund: fallback_match_unnumbered
-    und detect_possible_moves sind beide O(n^2) in der Anzahl unmatched/
-    geaenderter Kapitel - bei vielen Aenderungen auf grossen Dokumenten kann
-    das sehr lange dauern und wie ein Haenger wirken.
+Version 2.8 / 2026-09-05 / Grund: Bugfix - der Word-COM-Weg in attach_pages()
+    (normaler Vergleichslauf, nicht nur der Diagnose-Report-Modus) hatte KEIN
+    Zeitlimit. Haengt COM-Automation unerwartet (z.B. ein unsichtbarer
+    System-/Trust-Dialog blockiert DispatchEx/Documents.Open), blieb der
+    komplette Lauf bisher unbegrenzt stehen. Jetzt ueber _run_with_timeout()
+    abgesichert (45s je Dokument) - bei Ueberschreitung sauberer Rueckfall
+    auf LibreOffice statt endlosem Warten.
 
 Vergleicht zwei Word-Dokumente (.docx) auf Basis von Kapitelnummern als
 Fixpunkten und erzeugt einen eigenstaendigen HTML-Report:
@@ -58,7 +55,7 @@ from docx.oxml.ns import qn
 from docx.shared import Pt, RGBColor, Twips
 from lxml import etree
 
-SCRIPT_VERSION = "2.7"
+SCRIPT_VERSION = "2.8"
 REVIEW_SCHEMA_VERSION = "1.0"
 
 REVIEW_STATUS_OPTIONS = [
@@ -550,18 +547,29 @@ def assign_pages_via_word_com(chapters, docx_path, timeout=120):
             pass
 
 
-def attach_pages(chapters_a, chapters_b, path_a, path_b, soffice_path=None):
+def attach_pages(chapters_a, chapters_b, path_a, path_b, soffice_path=None, word_timeout_s=45):
     """Versucht, beiden Kapitel-Listen echte Seitenzahlen zuzuordnen.
     Reihenfolge: (1) MS Word per COM (exakt, nur Windows mit installiertem
     Word), (2) LibreOffice-Rendering + Textabgleich (Naeherung, aber
     plattformunabhaengig), (3) keine Seiteninfo. Gibt einen Status-String
-    zurueck: 'word_com', 'libreoffice' oder None (nicht verfuegbar)."""
+    zurueck: 'word_com', 'libreoffice' oder None (nicht verfuegbar).
+
+    WICHTIG: Der Word-COM-Weg wird ueber _run_with_timeout() mit einem
+    harten Zeitlimit (word_timeout_s) abgesichert - COM-Automation kann bei
+    unerwarteten Umstaenden (z.B. ein unsichtbarer System-/Trust-Dialog)
+    unbegrenzt haengen bleiben, ohne dass Python das von innen erkennen
+    wuerde. Bei Ueberschreitung wird sauber auf LibreOffice ausgewichen,
+    statt den ganzen Vergleich zum Stillstand zu bringen."""
     if find_word_com():
-        ok_a = assign_pages_via_word_com(chapters_a, path_a)
-        ok_b = assign_pages_via_word_com(chapters_b, path_b) if ok_a else False
+        status_a, ok_a, _, _ = _run_with_timeout(assign_pages_via_word_com, word_timeout_s, chapters_a, path_a)
+        ok_a = bool(ok_a) if status_a == "ok" else False
+        ok_b = False
+        if ok_a:
+            status_b, ok_b, _, _ = _run_with_timeout(assign_pages_via_word_com, word_timeout_s, chapters_b, path_b)
+            ok_b = bool(ok_b) if status_b == "ok" else False
         if ok_a and ok_b:
             return "word_com"
-        # Bei Teilerfolg lieber sauber zuruecksetzen und den anderen Weg probieren
+        # Bei Teilerfolg/Timeout lieber sauber zuruecksetzen und den anderen Weg probieren
         for ch in chapters_a:
             ch.pop("page", None)
         for ch in chapters_b:

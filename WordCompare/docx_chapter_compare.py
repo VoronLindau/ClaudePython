@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """
 docx_chapter_compare.py
-Version 3.0 / 2026-09-05 / Grund: Echter Bugfix (Ursache konkret bestaetigt,
-    Fix auf Windows/Word nicht selbst testbar) - assign_pages_via_word_com()
-    fragte Seitenzahlen bisher ueber first_para_index (Absatz-Index) ab.
-    first_para_index wird beim Einlesen ueber python-docx's document.
-    paragraphs gezaehlt, das TABELLEN-INHALT KOMPLETT UEBERSPRINGT (bewiesen:
-    document.paragraphs zaehlt Absaetze in Tabellenzellen nicht mit). Word
-    selbst (COM Document.Paragraphs) zaehlt sie mit. Jede Tabelle vor einem
-    Kapitel (Deckblatt, Revisionshistorie etc.) verschob dadurch den Index
-    und fuehrte zu einer zu NIEDRIGEN Seitenzahl - bei einem realen
-    98-Seiten-Dokument wurde Seite 30 als Seite 17 angezeigt. Fragt jetzt
-    NICHT mehr ueber Index ab, sondern sucht den Kapiteltext direkt per
-    Word.Range.Find (wie beim LibreOffice-Weg) - unabhaengig von Tabellen/
-    Absatz-Zaehlung.
+Version 3.1 / 2026-09-17 / Grund: Bugfix - der in Version 3.0 eingefuehrte
+    Range.Find-Aufruf in assign_pages_via_word_com() gab bei "spaeter
+    Bindung" (DispatchEx) mit vielen Positionsargumenten an Execute()
+    vermutlich STILL immer False zurueck (keine Python-Exception, einfach
+    keine Treffer) - die Funktion meldete aber trotzdem bedingungslos
+    Erfolg (return True), wodurch attach_pages() faelschlich NICHT auf
+    LibreOffice auswich. Ergebnis: keine Seitenzahlen mehr im Bericht (statt
+    ungenauer/falscher wie vorher). Fix: Find-Eigenschaften (Text, Forward,
+    Wrap, MatchCase, ...) werden jetzt einzeln gesetzt statt als
+    Positionsargumente uebergeben (robuster bei spaeter Bindung), UND die
+    Funktion meldet nur noch dann Erfolg, wenn tatsaechlich mindestens eine
+    Seitenzahl gefunden wurde - sonst greift der LibreOffice-Rueckfall wie
+    vorgesehen.
 
 Vergleicht zwei Word-Dokumente (.docx) auf Basis von Kapitelnummern als
 Fixpunkten und erzeugt einen eigenstaendigen HTML-Report:
@@ -61,7 +61,7 @@ from docx.oxml.ns import qn
 from docx.shared import Pt, RGBColor, Twips
 from lxml import etree
 
-SCRIPT_VERSION = "3.0"
+SCRIPT_VERSION = "3.1"
 REVIEW_SCHEMA_VERSION = "1.0"
 
 REVIEW_STATUS_OPTIONS = [
@@ -559,6 +559,7 @@ def assign_pages_via_word_com(chapters, docx_path, timeout=120):
         FIND_KEY_LEN = 80  # Word's Find hat praktische Laengenbeschraenkungen - grosszuegig, aber sicher
         doc_end = doc.Content.End
         cursor_start = 0
+        found_count = 0
 
         for ch in chapters:
             key = normalize_whitespace(ch.get("text", ""))[:FIND_KEY_LEN]
@@ -567,17 +568,38 @@ def assign_pages_via_word_com(chapters, docx_path, timeout=120):
                 continue
             try:
                 rng = doc.Range(cursor_start, doc_end)
-                found = rng.Find.Execute(
-                    key, False, False, False, False, False, True, WD_FIND_STOP, False, "", 0,
-                )
+                # Eigenschaften einzeln setzen statt viele Positionsargumente an
+                # Execute() zu uebergeben - bei "spaeter Bindung" (DispatchEx,
+                # kein generiertes Wrapper-Modul) ist das deutlich zuverlaessiger,
+                # eine falsch interpretierte Positions-/Typ-Zuordnung kann sonst
+                # STILL fehlschlagen (Execute() liefert dann ueberall False,
+                # ohne Python-Exception - genau das fuehrte zuvor dazu, dass
+                # trotz gemeldetem "Erfolg" gar keine Seitenzahlen ankamen).
+                f = rng.Find
+                f.ClearFormatting()
+                f.Text = key
+                f.Forward = True
+                f.Wrap = WD_FIND_STOP
+                f.MatchCase = False
+                f.MatchWholeWord = False
+                f.MatchWildcards = False
+                found = f.Execute()
                 if found:
                     ch["page"] = rng.Information(WD_ACTIVE_END_PAGE_NUMBER)
                     cursor_start = rng.End
+                    found_count += 1
                 else:
                     ch["page"] = None
             except Exception:
                 ch["page"] = None
-        return True
+
+        # WICHTIG: Nur als Erfolg melden, wenn tatsaechlich mindestens eine
+        # Seitenzahl ermittelt wurde. Vorher wurde hier bedingungslos True
+        # zurueckgegeben, selbst wenn JEDE Find()-Abfrage fehlschlug - der
+        # Aufrufer hielt den Word-COM-Weg dann faelschlich fuer erfolgreich
+        # und wich NICHT auf LibreOffice aus, wodurch am Ende gar keine
+        # Seitenzahlen im Bericht auftauchten (statt falscher/genauer welche).
+        return found_count > 0
     except Exception:
         return False
     finally:

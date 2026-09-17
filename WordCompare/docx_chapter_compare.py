@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """
 docx_chapter_compare.py
-Version 2.8 / 2026-09-05 / Grund: Bugfix - der Word-COM-Weg in attach_pages()
-    (normaler Vergleichslauf, nicht nur der Diagnose-Report-Modus) hatte KEIN
-    Zeitlimit. Haengt COM-Automation unerwartet (z.B. ein unsichtbarer
-    System-/Trust-Dialog blockiert DispatchEx/Documents.Open), blieb der
-    komplette Lauf bisher unbegrenzt stehen. Jetzt ueber _run_with_timeout()
-    abgesichert (45s je Dokument) - bei Ueberschreitung sauberer Rueckfall
-    auf LibreOffice statt endlosem Warten.
+Version 2.9 / 2026-09-05 / Grund: Vermuteter Bugfix (auf echtem
+    Windows+Word nicht selbst testbar, da kein Windows verfuegbar) - der
+    Word-COM-Pfad in assign_pages_via_word_com() oeffnet Dokumente mit
+    Visible=False; dabei berechnet Word die Seitenumbrueche bekanntermassen
+    teils nicht zuverlaessig neu, bevor Range.Information(
+    wdActiveEndPageNumber) abgefragt wird - Anwender berichtete bei einem
+    98-seitigen Dokument durchgehend zu niedrige Seitenzahlen. Erzwingt jetzt
+    vor der ersten Abfrage explizit doc.Repaginate() + doc.ComputeStatistics
+    (wdStatisticPages) sowie die Seitenlayout-Ansicht. Nicht-Windows-Pfad
+    (LibreOffice/kein Word) unveraendert.
 
 Vergleicht zwei Word-Dokumente (.docx) auf Basis von Kapitelnummern als
 Fixpunkten und erzeugt einen eigenstaendigen HTML-Report:
@@ -55,7 +58,7 @@ from docx.oxml.ns import qn
 from docx.shared import Pt, RGBColor, Twips
 from lxml import etree
 
-SCRIPT_VERSION = "2.8"
+SCRIPT_VERSION = "2.9"
 REVIEW_SCHEMA_VERSION = "1.0"
 
 REVIEW_STATUS_OPTIONS = [
@@ -517,6 +520,24 @@ def assign_pages_via_word_com(chapters, docx_path, timeout=120):
         doc = word.Documents.Open(
             str(Path(docx_path).resolve()), ReadOnly=True, AddToRecentFiles=False, Visible=False,
         )
+        # WICHTIG: Bei unsichtbar (Visible=False) geoeffneten Dokumenten
+        # berechnet Word die Seitenumbrueche teils nicht zuverlaessig neu,
+        # bevor Range.Information(wdActiveEndPageNumber) abgefragt wird - ein
+        # bekanntes Verhalten bei COM-Automation im Hintergrund. Erzwingt hier
+        # explizit eine vollstaendige Neuberechnung der Paginierung, bevor
+        # ueberhaupt eine Seitenzahl abgefragt wird.
+        try:
+            doc.ActiveWindow.View.Type = 3  # wdPrintView - Seitenlayout-Ansicht
+        except Exception:
+            pass
+        try:
+            doc.Repaginate()
+        except Exception:
+            pass
+        try:
+            doc.ComputeStatistics(2)  # wdStatisticPages - erzwingt zusaetzlich volle Seitenberechnung
+        except Exception:
+            pass
         WD_ACTIVE_END_PAGE_NUMBER = 3
         page_by_index = {}
         wanted_set = set(wanted_indices)
@@ -1363,12 +1384,15 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
         </div>"""
         manual_link_box = f"""
         <div class="manual-link-box" data-link-key="{html.escape(r['key'], quote=True)}">
-          <label for="ml-{safe_id}">🔗 Manuell verknüpfen mit:</label>
-          <input type="text" id="ml-{safe_id}" class="manual-link-input" list="chapter-datalist"
-                 placeholder="Kapitelnummer eingeben…" oninput="onManualLinkChange('{safe_id}')"
-                 autocomplete="off">
-          <button type="button" class="ml-btn" onclick="jumpToManualLink('{safe_id}')" title="Zur verknüpften Zeile springen">↷</button>
-          <button type="button" class="ml-btn ml-clear" onclick="clearManualLink('{safe_id}')" title="Verknüpfung zurücknehmen">✕</button>
+          <div class="ml-row">
+            <label for="ml-{safe_id}">🔗 Manuell verknüpfen mit:</label>
+            <input type="text" id="ml-{safe_id}" class="manual-link-input" list="chapter-datalist"
+                   placeholder="Kapitelnummer eingeben…" oninput="onManualLinkChange('{safe_id}')"
+                   autocomplete="off">
+            <button type="button" class="ml-btn" onclick="jumpToManualLink('{safe_id}')" title="Zur verknüpften Zeile springen">↷</button>
+            <button type="button" class="ml-btn ml-clear" onclick="clearManualLink('{safe_id}')" title="Verknüpfung zurücknehmen">✕</button>
+          </div>
+          <div class="link-diff" id="ld-{safe_id}"></div>
         </div>"""
         # Abstand zur vorherigen Zeile nur einfuegen, wenn mindestens eine
         # Seite hier tatsaechlich eine neue Seiten-Gruppe beginnt - so
@@ -1457,6 +1481,14 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
     review_schema_json = json.dumps(REVIEW_SCHEMA_VERSION)
     chapter_keys_json = json.dumps({r["key"]: r["number"] for r in rows}, ensure_ascii=False)
     safe_id_to_key_json = json.dumps({_safe_id(r["key"]): r["key"] for r in rows}, ensure_ascii=False)
+    # Rohe (nicht bereits diff-gerenderte) Texte je Kapitel - werden fuer den
+    # client-seitigen Wort-Diff bei MANUELLEN Verknuepfungen gebraucht: dort
+    # werden zwei beliebige (nicht vom normalen Matching gepaarte) Kapitel
+    # verglichen, das kann nur im Browser zur Laufzeit passieren.
+    row_texts_json = json.dumps(
+        {r["key"]: {"a": r.get("text_a_raw") or "", "b": r.get("text_b_raw") or ""} for r in rows},
+        ensure_ascii=False,
+    )
 
     return f"""<!DOCTYPE html>
 <html lang="de">
@@ -1658,15 +1690,21 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
   .review-box.rv-refinement_customer {{ background: #eff6ff; }}
   .review-box.rv-internal_clarification {{ background: #fff7ed; }}
   .manual-link-box {{
-    display: flex; align-items: center; gap: 8px;
     background: #fafafa; border: 1px solid var(--border); border-top: none;
     border-radius: 0 0 6px 6px; padding: 6px 12px; font-size: 12px;
   }}
+  .ml-row {{ display: flex; align-items: center; gap: 8px; }}
   .manual-link-box label {{ color: #666; white-space: nowrap; }}
   .manual-link-input {{ flex: 1; font-size: 12px; padding: 4px 8px; border-radius: 4px; border: 1px solid var(--border); }}
   .manual-link-box.ml-valid {{ background: #eff6ff; }}
   .manual-link-box.ml-valid .manual-link-input {{ border-color: #2563eb; color: #1d4ed8; }}
   .manual-link-box.ml-invalid .manual-link-input {{ border-color: #dc2626; color: #b91c1c; }}
+  .link-diff {{
+    margin-top: 8px; padding: 8px 10px; background: #fff; border: 1px solid #bfdbfe;
+    border-radius: 4px; font-size: 12px; line-height: 1.5; display: none;
+  }}
+  .link-diff.ld-visible {{ display: block; }}
+  .link-diff .ld-label {{ font-size: 10px; text-transform: uppercase; letter-spacing: 0.03em; color: #2563eb; font-weight: 700; margin-bottom: 4px; }}
   .ml-btn {{
     border: 1px solid var(--border); background: #fff; border-radius: 4px;
     padding: 3px 8px; font-size: 12px; cursor: pointer; color: #444;
@@ -1729,8 +1767,10 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
   const REVIEW_STATUS_VALUES = ['accepted', 'not_accepted', 'refinement_customer', 'internal_clarification'];
   const CHAPTER_KEYS = {chapter_keys_json};       // key -> Kapitelnummer (fuer Anzeige/Abgleich)
   const SAFE_ID_TO_KEY = {safe_id_to_key_json};   // safe_id -> key
+  const ROW_TEXTS = {row_texts_json};             // key -> {{a, b}} Rohtext beider Seiten, fuer den Verknuepfungs-Diff
   const KEY_TO_SAFE_ID = Object.fromEntries(Object.entries(SAFE_ID_TO_KEY).map(function(e) {{ return [e[1], e[0]]; }}));
   const MANUAL_LINKS = {{}};  // safe_id -> Ziel-key (nur im Speicher, Persistenz ueber Review-JSON)
+  const LINK_DIFF_MAX_TOKENS = 4000;  // Sicherheitsgrenze gegen sehr lange Texte (LCS ist O(n*m))
 
   const REVIEW_BOXES = {{}};
   document.querySelectorAll('.review-box').forEach(function(box) {{
@@ -1792,6 +1832,79 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
     if (filterMode === 'unreviewed') {{ setFilter('unreviewed'); }}
   }}
 
+  function tokenizeWords(text) {{
+    return (text || '').match(/\\s+|\\S+/g) || [];
+  }}
+
+  function escHtml(s) {{
+    const d = document.createElement('div');
+    d.textContent = s;
+    return d.innerHTML;
+  }}
+
+  // Einfacher Wort-Diff via LCS (Longest Common Subsequence) - laeuft rein
+  // im Browser, wird gebraucht weil bei manuellen Verknuepfungen zwei
+  // Kapitel verglichen werden, die das normale (server-seitige) Matching nie
+  // gegenueberstellt hat. O(n*m) - bei sehr langen Texten (siehe
+  // LINK_DIFF_MAX_TOKENS) wird stattdessen unmarkierter Text angezeigt,
+  // um den Browser nicht zu blockieren.
+  function wordDiffHtml(textA, textB) {{
+    const a = tokenizeWords(textA);
+    const b = tokenizeWords(textB);
+    const n = a.length, m = b.length;
+    if (n * m > LINK_DIFF_MAX_TOKENS * LINK_DIFF_MAX_TOKENS || n + m > LINK_DIFF_MAX_TOKENS) {{
+      return [escHtml(textA), escHtml(textB), false];
+    }}
+    const dp = new Array(n + 1);
+    for (let i = 0; i <= n; i++) {{ dp[i] = new Int32Array(m + 1); }}
+    for (let i = n - 1; i >= 0; i--) {{
+      for (let j = m - 1; j >= 0; j--) {{
+        dp[i][j] = a[i] === b[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+      }}
+    }}
+    let i = 0, j = 0;
+    const left = [], right = [];
+    while (i < n && j < m) {{
+      if (a[i] === b[j]) {{
+        left.push(escHtml(a[i])); right.push(escHtml(b[j]));
+        i++; j++;
+      }} else if (dp[i + 1][j] >= dp[i][j + 1]) {{
+        left.push('<span class="del">' + escHtml(a[i]) + '</span>');
+        i++;
+      }} else {{
+        right.push('<span class="ins">' + escHtml(b[j]) + '</span>');
+        j++;
+      }}
+    }}
+    while (i < n) {{ left.push('<span class="del">' + escHtml(a[i]) + '</span>'); i++; }}
+    while (j < m) {{ right.push('<span class="ins">' + escHtml(b[j]) + '</span>'); j++; }}
+    return [left.join(''), right.join(''), true];
+  }}
+
+  function updateLinkDiff(id) {{
+    const diffBox = document.getElementById('ld-' + id);
+    if (!diffBox) {{ return; }}
+    const ownKey = SAFE_ID_TO_KEY[id];
+    const targetKey = MANUAL_LINKS[id];
+    if (!targetKey || !ROW_TEXTS[ownKey] || !ROW_TEXTS[targetKey]) {{
+      diffBox.classList.remove('ld-visible');
+      diffBox.innerHTML = '';
+      return;
+    }}
+    // "Verschwundener" Text der Quelle (bevorzugt Seite A - Dokument alt)
+    // gegen "aufgetauchten" Text des Ziels (bevorzugt Seite B - Dokument neu) -
+    // das bildet die typische "wohin ist der Inhalt gewandert"-Frage ab.
+    const ownText = ROW_TEXTS[ownKey].a || ROW_TEXTS[ownKey].b || '';
+    const targetText = ROW_TEXTS[targetKey].b || ROW_TEXTS[targetKey].a || '';
+    const [leftHtml, rightHtml, wasCompared] = wordDiffHtml(ownText, targetText);
+    const targetNumber = CHAPTER_KEYS[targetKey] || targetKey;
+    diffBox.innerHTML =
+      '<div class="ld-label">' + (wasCompared ? 'Unterschied' : 'Vergleich (Text zu lang fuer Markierung)') +
+      ' zu Kapitel ' + escHtml(targetNumber) + ':</div>' +
+      '<div>' + leftHtml + '</div><div style="margin-top:4px;">' + rightHtml + '</div>';
+    diffBox.classList.add('ld-visible');
+  }}
+
   function onManualLinkChange(id) {{
     const input = document.getElementById('ml-' + id);
     const box = input.closest('.manual-link-box');
@@ -1800,6 +1913,7 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
     box.classList.remove('ml-valid', 'ml-invalid');
     if (!val) {{
       delete MANUAL_LINKS[id];
+      updateLinkDiff(id);
       return;
     }}
     const foundKey = Object.keys(CHAPTER_KEYS).find(function(k) {{
@@ -1812,6 +1926,7 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
       delete MANUAL_LINKS[id];
       box.classList.add('ml-invalid');
     }}
+    updateLinkDiff(id);
   }}
 
   function clearManualLink(id) {{

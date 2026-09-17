@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """
 docx_chapter_compare.py
-Version 2.9 / 2026-09-05 / Grund: Vermuteter Bugfix (auf echtem
-    Windows+Word nicht selbst testbar, da kein Windows verfuegbar) - der
-    Word-COM-Pfad in assign_pages_via_word_com() oeffnet Dokumente mit
-    Visible=False; dabei berechnet Word die Seitenumbrueche bekanntermassen
-    teils nicht zuverlaessig neu, bevor Range.Information(
-    wdActiveEndPageNumber) abgefragt wird - Anwender berichtete bei einem
-    98-seitigen Dokument durchgehend zu niedrige Seitenzahlen. Erzwingt jetzt
-    vor der ersten Abfrage explizit doc.Repaginate() + doc.ComputeStatistics
-    (wdStatisticPages) sowie die Seitenlayout-Ansicht. Nicht-Windows-Pfad
-    (LibreOffice/kein Word) unveraendert.
+Version 3.0 / 2026-09-05 / Grund: Echter Bugfix (Ursache konkret bestaetigt,
+    Fix auf Windows/Word nicht selbst testbar) - assign_pages_via_word_com()
+    fragte Seitenzahlen bisher ueber first_para_index (Absatz-Index) ab.
+    first_para_index wird beim Einlesen ueber python-docx's document.
+    paragraphs gezaehlt, das TABELLEN-INHALT KOMPLETT UEBERSPRINGT (bewiesen:
+    document.paragraphs zaehlt Absaetze in Tabellenzellen nicht mit). Word
+    selbst (COM Document.Paragraphs) zaehlt sie mit. Jede Tabelle vor einem
+    Kapitel (Deckblatt, Revisionshistorie etc.) verschob dadurch den Index
+    und fuehrte zu einer zu NIEDRIGEN Seitenzahl - bei einem realen
+    98-Seiten-Dokument wurde Seite 30 als Seite 17 angezeigt. Fragt jetzt
+    NICHT mehr ueber Index ab, sondern sucht den Kapiteltext direkt per
+    Word.Range.Find (wie beim LibreOffice-Weg) - unabhaengig von Tabellen/
+    Absatz-Zaehlung.
 
 Vergleicht zwei Word-Dokumente (.docx) auf Basis von Kapitelnummern als
 Fixpunkten und erzeugt einen eigenstaendigen HTML-Report:
@@ -58,7 +61,7 @@ from docx.oxml.ns import qn
 from docx.shared import Pt, RGBColor, Twips
 from lxml import etree
 
-SCRIPT_VERSION = "2.9"
+SCRIPT_VERSION = "3.0"
 REVIEW_SCHEMA_VERSION = "1.0"
 
 REVIEW_STATUS_OPTIONS = [
@@ -495,9 +498,22 @@ def assign_pages_via_word_com(chapters, docx_path, timeout=120):
     Fehler auftrat (dann bleibt ch['page'] unveraendert, damit der Aufrufer
     z.B. noch auf LibreOffice ausweichen kann).
 
+    WICHTIG (Bugfix): Fragt NICHT mehr ueber first_para_index (Absatz-Index)
+    nach, sondern sucht den Kapiteltext direkt per Word.Range.Find - genau
+    wie beim LibreOffice-Weg. Grund: first_para_index wird beim Einlesen ueber
+    python-docx's document.paragraphs gezaehlt, das TABELLEN-INHALT KOMPLETT
+    UEBERSPRINGT (Absaetze innerhalb von Tabellenzellen zaehlen dort nicht
+    mit). Word selbst (COM Document.Paragraphs) zaehlt Tabellenabsaetze aber
+    mit. Jede Tabelle vor einem Kapitel (Deckblatt, Revisionshistorie, etc.)
+    hat dadurch bisher den Index verschoben und zu einer FALSCHEN (zu
+    fruehen) Seitenzahl gefuehrt - bei grossen Dokumenten mit mehreren
+    Tabellen potenziell erheblich (real beobachtet: Seite 30 angezeigt als
+    Seite 17). Die textbasierte Suche ist von Tabellen/Absatz-Zaehlung
+    unabhaengig.
+
     HINWEIS: Dieser Pfad ist speziell fuer Rechner ohne LibreOffice, aber mit
     installiertem MS Office (z.B. Firmenrechner) gedacht. Nutzt die COM-
-    Konstante wdActiveEndPageNumber (=3) von Word.Range.Information(...).
+    Konstante wdActiveEndPageNumber (=3) von Range.Information(...).
     """
     if sys.platform != "win32":
         return False
@@ -507,8 +523,7 @@ def assign_pages_via_word_com(chapters, docx_path, timeout=120):
     except ImportError:
         return False
 
-    wanted_indices = sorted({ch["first_para_index"] for ch in chapters if ch.get("first_para_index", -1) >= 0})
-    if not wanted_indices:
+    if not chapters:
         return False
 
     word = None
@@ -538,20 +553,30 @@ def assign_pages_via_word_com(chapters, docx_path, timeout=120):
             doc.ComputeStatistics(2)  # wdStatisticPages - erzwingt zusaetzlich volle Seitenberechnung
         except Exception:
             pass
+
         WD_ACTIVE_END_PAGE_NUMBER = 3
-        page_by_index = {}
-        wanted_set = set(wanted_indices)
-        max_wanted = wanted_indices[-1]
-        for i, para in enumerate(doc.Paragraphs):
-            if i > max_wanted:
-                break
-            if i in wanted_set:
-                try:
-                    page_by_index[i] = para.Range.Information(WD_ACTIVE_END_PAGE_NUMBER)
-                except Exception:
-                    pass
+        WD_FIND_STOP = 0  # nicht am Dokumentende zum Anfang zurueckspringen
+        FIND_KEY_LEN = 80  # Word's Find hat praktische Laengenbeschraenkungen - grosszuegig, aber sicher
+        doc_end = doc.Content.End
+        cursor_start = 0
+
         for ch in chapters:
-            ch["page"] = page_by_index.get(ch.get("first_para_index", -1))
+            key = normalize_whitespace(ch.get("text", ""))[:FIND_KEY_LEN]
+            if not key or cursor_start >= doc_end:
+                ch["page"] = None
+                continue
+            try:
+                rng = doc.Range(cursor_start, doc_end)
+                found = rng.Find.Execute(
+                    key, False, False, False, False, False, True, WD_FIND_STOP, False, "", 0,
+                )
+                if found:
+                    ch["page"] = rng.Information(WD_ACTIVE_END_PAGE_NUMBER)
+                    cursor_start = rng.End
+                else:
+                    ch["page"] = None
+            except Exception:
+                ch["page"] = None
         return True
     except Exception:
         return False
@@ -1770,7 +1795,7 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
   const ROW_TEXTS = {row_texts_json};             // key -> {{a, b}} Rohtext beider Seiten, fuer den Verknuepfungs-Diff
   const KEY_TO_SAFE_ID = Object.fromEntries(Object.entries(SAFE_ID_TO_KEY).map(function(e) {{ return [e[1], e[0]]; }}));
   const MANUAL_LINKS = {{}};  // safe_id -> Ziel-key (nur im Speicher, Persistenz ueber Review-JSON)
-  const LINK_DIFF_MAX_TOKENS = 4000;  // Sicherheitsgrenze gegen sehr lange Texte (LCS ist O(n*m))
+  const LINK_DIFF_MAX_TOKENS = 10000;  // Sicherheitsgrenze - Myers-Diff bleibt bis hierhin schnell genug
 
   const REVIEW_BOXES = {{}};
   document.querySelectorAll('.review-box').forEach(function(box) {{
@@ -1842,42 +1867,87 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
     return d.innerHTML;
   }}
 
-  // Einfacher Wort-Diff via LCS (Longest Common Subsequence) - laeuft rein
-  // im Browser, wird gebraucht weil bei manuellen Verknuepfungen zwei
-  // Kapitel verglichen werden, die das normale (server-seitige) Matching nie
-  // gegenueberstellt hat. O(n*m) - bei sehr langen Texten (siehe
-  // LINK_DIFF_MAX_TOKENS) wird stattdessen unmarkierter Text angezeigt,
-  // um den Browser nicht zu blockieren.
+  // Myers-Diff (O(N*D) statt O(n*m) wie bei einer klassischen LCS-Tabelle) -
+  // laeuft rein im Browser, wird gebraucht weil bei manuellen Verknuepfungen
+  // zwei Kapitel verglichen werden, die das normale (server-seitige)
+  // Matching nie gegenuebergestellt hat. Bei sehr aehnlichen Texten (der
+  // Normalfall) extrem schnell (D ist klein); selbst bei komplett
+  // unterschiedlichen Texten bis LINK_DIFF_MAX_TOKENS Woertern zusammen noch
+  // im Sekundenbereich (getestet: 5000+5000 komplett unterschiedliche
+  // Woerter < 1.3s). Nur jenseits dieser Grenze (sehr seltener Fall) wird
+  // auf unmarkierten Text ausgewichen, um den Browser nicht zu blockieren.
+  function myersDiffOps(a, b) {{
+    const n = a.length, m = b.length;
+    if (n === 0 && m === 0) {{ return []; }}
+    const max = n + m;
+    const offset = max;
+    const size = 2 * max + 1;
+    let v = new Int32Array(size);
+    const trace = [];
+    outer:
+    for (let d = 0; d <= max; d++) {{
+      trace.push(v.slice());
+      for (let k = -d; k <= d; k += 2) {{
+        let x;
+        if (k === -d || (k !== d && v[k - 1 + offset] < v[k + 1 + offset])) {{
+          x = v[k + 1 + offset];
+        }} else {{
+          x = v[k - 1 + offset] + 1;
+        }}
+        let y = x - k;
+        while (x < n && y < m && a[x] === b[y]) {{ x++; y++; }}
+        v[k + offset] = x;
+        if (x >= n && y >= m) {{ break outer; }}
+      }}
+    }}
+    let x = n, y = m;
+    const ops = [];
+    for (let d = trace.length - 1; d >= 0; d--) {{
+      const vPrev = trace[d];
+      const k = x - y;
+      let prevK;
+      if (k === -d || (k !== d && vPrev[k - 1 + offset] < vPrev[k + 1 + offset])) {{
+        prevK = k + 1;
+      }} else {{
+        prevK = k - 1;
+      }}
+      const prevX = vPrev[prevK + offset];
+      const prevY = prevX - prevK;
+      while (x > prevX && y > prevY) {{
+        ops.push({{op: 'equal', tok: a[x - 1]}});
+        x--; y--;
+      }}
+      if (d > 0) {{
+        if (x === prevX) {{
+          ops.push({{op: 'ins', tok: b[y - 1]}});
+          y--;
+        }} else {{
+          ops.push({{op: 'del', tok: a[x - 1]}});
+          x--;
+        }}
+      }}
+    }}
+    ops.reverse();
+    return ops;
+  }}
+
   function wordDiffHtml(textA, textB) {{
     const a = tokenizeWords(textA);
     const b = tokenizeWords(textB);
-    const n = a.length, m = b.length;
-    if (n * m > LINK_DIFF_MAX_TOKENS * LINK_DIFF_MAX_TOKENS || n + m > LINK_DIFF_MAX_TOKENS) {{
+    if (a.length + b.length > LINK_DIFF_MAX_TOKENS) {{
       return [escHtml(textA), escHtml(textB), false];
     }}
-    const dp = new Array(n + 1);
-    for (let i = 0; i <= n; i++) {{ dp[i] = new Int32Array(m + 1); }}
-    for (let i = n - 1; i >= 0; i--) {{
-      for (let j = m - 1; j >= 0; j--) {{
-        dp[i][j] = a[i] === b[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
-      }}
-    }}
-    let i = 0, j = 0;
+    const ops = myersDiffOps(a, b);
     const left = [], right = [];
-    while (i < n && j < m) {{
-      if (a[i] === b[j]) {{
-        left.push(escHtml(a[i])); right.push(escHtml(b[j]));
-        i++; j++;
-      }} else if (dp[i + 1][j] >= dp[i][j + 1]) {{
-        left.push('<span class="del">' + escHtml(a[i]) + '</span>');
-        i++;
+    for (const o of ops) {{
+      if (o.op === 'equal') {{
+        left.push(escHtml(o.tok)); right.push(escHtml(o.tok));
+      }} else if (o.op === 'del') {{
+        left.push('<span class="del">' + escHtml(o.tok) + '</span>');
       }} else {{
-        right.push('<span class="ins">' + escHtml(b[j]) + '</span>');
-        j++;
+        right.push('<span class="ins">' + escHtml(o.tok) + '</span>');
       }}
     }}
-    while (i < n) {{ left.push('<span class="del">' + escHtml(a[i]) + '</span>'); i++; }}
-    while (j < m) {{ right.push('<span class="ins">' + escHtml(b[j]) + '</span>'); j++; }}
     return [left.join(''), right.join(''), true];
   }}
 

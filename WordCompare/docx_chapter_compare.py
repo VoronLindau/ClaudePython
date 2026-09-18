@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 """
 docx_chapter_compare.py
-Version 3.1 / 2026-09-17 / Grund: Bugfix - der in Version 3.0 eingefuehrte
-    Range.Find-Aufruf in assign_pages_via_word_com() gab bei "spaeter
-    Bindung" (DispatchEx) mit vielen Positionsargumenten an Execute()
-    vermutlich STILL immer False zurueck (keine Python-Exception, einfach
-    keine Treffer) - die Funktion meldete aber trotzdem bedingungslos
-    Erfolg (return True), wodurch attach_pages() faelschlich NICHT auf
-    LibreOffice auswich. Ergebnis: keine Seitenzahlen mehr im Bericht (statt
-    ungenauer/falscher wie vorher). Fix: Find-Eigenschaften (Text, Forward,
-    Wrap, MatchCase, ...) werden jetzt einzeln gesetzt statt als
-    Positionsargumente uebergeben (robuster bei spaeter Bindung), UND die
-    Funktion meldet nur noch dann Erfolg, wenn tatsaechlich mindestens eine
-    Seitenzahl gefunden wurde - sonst greift der LibreOffice-Rueckfall wie
-    vorgesehen.
+Version 3.2 / 2026-09-17 / Grund: Wichtiger Bugfix - Kapitel-Erkennung
+    unterstuetzte bisher nur EINEN von drei ueblichen Word-Mechanismen fuer
+    automatische Nummerierung ("mit Formatvorlage verknuepft" direkt in
+    numbering.xml). Ein echtes Testdokument (90 Kapitel) nutzte stattdessen
+    den haeufigeren Weg - Nummerierung DIREKT am Absatz (<w:pPr><w:numPr>) -
+    und wurde deshalb komplett als EIN einziges Fallback-Kapitel erkannt
+    (89 von 90 Kapiteln fielen unter den Tisch, dadurch waren logischerweise
+    auch alle Seitenzahlen witzlos falsch - das eigentliche Problem lag also
+    nicht an der Seiten-Erkennung selbst). Jetzt werden alle drei Wege
+    unterstuetzt: (1) Numerierung direkt am Absatz, (2) Numerierung an der
+    Formatvorlage selbst (styles.xml), (3) "mit Formatvorlage verknuepft" in
+    numbering.xml (bisheriger Mechanismus). Mit einem realen 90-Kapitel-
+    Testdokument gegen 3 von Hand geprueften Referenz-Seitenzahlen aus MS
+    Word verifiziert (alle 3 exakt getroffen).
 
 Vergleicht zwei Word-Dokumente (.docx) auf Basis von Kapitelnummern als
 Fixpunkten und erzeugt einen eigenstaendigen HTML-Report:
@@ -61,7 +62,7 @@ from docx.oxml.ns import qn
 from docx.shared import Pt, RGBColor, Twips
 from lxml import etree
 
-SCRIPT_VERSION = "3.1"
+SCRIPT_VERSION = "3.2"
 REVIEW_SCHEMA_VERSION = "1.0"
 
 REVIEW_STATUS_OPTIONS = [
@@ -100,82 +101,196 @@ DOT_CONTINUATION_RE = re.compile(r"^\.(\d+(?:\.\d+)*[a-zA-Z]?)\s*\t?\s*(.*)$")
 WEB_SAFE_IMAGE_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/gif", "image/bmp", "image/webp"}
 
 # ---------------------------------------------------------------------------
-# Formatvorlagen-verknuepfte automatische Nummerierung ("Ueberschrift 1/2/...")
+# Automatische Kapitel-Nummerierung ueber Word-Listen
 # ---------------------------------------------------------------------------
 #
 # Viele Word-Vorlagen nummerieren Kapitelueberschriften NICHT als Text,
-# sondern ueber eine automatische, mit der Formatvorlage verknuepfte Liste
-# (word/numbering.xml: <w:abstractNum><w:lvl><w:pStyle val="Heading1"/>...).
-# Die Zahl ("2", "2.1", ...) existiert dann NUR als Rendering-Ergebnis und
-# steht nirgends im gespeicherten Absatztext - sie muss durch Nachbilden der
-# Word-Zaehllogik rekonstruiert werden (pro Ebene hochzaehlen, tiefere Ebenen
-# zuruecksetzen, wenn eine flachere Ebene wieder auftaucht).
+# sondern ueber eine automatische Liste. Die Zahl ("2", "2.1", ...) existiert
+# dann NUR als Rendering-Ergebnis und steht nirgends im gespeicherten
+# Absatztext - sie muss durch Nachbilden der Word-Zaehllogik rekonstruiert
+# werden (pro Ebene hochzaehlen, tiefere Ebenen zuruecksetzen, wenn eine
+# flachere Ebene erneut auftritt). Word kennt dafuer DREI unterschiedliche
+# Verknuepfungswege, die alle in freier Wildbahn vorkommen und deshalb alle
+# unterstuetzt werden:
+#   1) Direkt am Absatz: <w:pPr><w:numPr><w:numId val="X"/></w:numPr></w:pPr>
+#      - der haeufigste Fall bei "normal" numerierten Ueberschriften.
+#   2) An der Formatvorlage selbst: <w:style><w:pPr><w:numPr>...
+#      in styles.xml - die Formatvorlage traegt ihre Numerierung direkt mit.
+#   3) "Mit Formatvorlage verknuepft" in numbering.xml:
+#      <w:abstractNum><w:lvl><w:pStyle val="Heading1"/>...> - die Numerierung
+#      ist in der Listendefinition selbst an eine Formatvorlage gebunden
+#      (kein numPr am Absatz oder an der Formatvorlage noetig).
+# Reihenfolge bei der Aufloesung entspricht Words eigener Prioritaet: zuerst
+# der Absatz selbst, dann die Formatvorlage, zuletzt die Verknuepfung in
+# numbering.xml.
 
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 
 
-def _load_style_numbering(docx_path):
-    """Liest word/numbering.xml (falls vorhanden) und liefert
-    {style_id: {"ilvl": int, "start": int}} fuer alle Ueberschriften-Ebenen,
-    deren automatische Nummerierung ueber 'Formatvorlage verknuepfen'
-    (pStyle innerhalb <w:lvl>) funktioniert. Nur numFmt='decimal' wird
-    unterstuetzt (roemisch/alphabetisch etc. werden ausgelassen). Liefert
-    {} wenn keine Numerierung vorhanden ist oder die Datei nicht lesbar ist."""
+def _load_numbering_definitions(docx_path):
+    """Liest word/numbering.xml und liefert (num_to_abstract, abstract_levels,
+    style_linked): num_to_abstract = {numId: abstractNumId}; abstract_levels =
+    {abstractNumId: {ilvl: {"start": int}}} (nur numFmt='decimal' - andere
+    Formate wie roemisch/alphabetisch werden ausgelassen); style_linked =
+    {style_id: {"ilvl": int, "start": int}} fuer Weg 3 (pStyle direkt in
+    <w:lvl>). Liefert (({}, {}, {})) wenn keine numbering.xml vorhanden oder
+    nicht lesbar ist."""
     try:
         with zipfile.ZipFile(docx_path) as z:
             if "word/numbering.xml" not in z.namelist():
-                return {}
+                return {}, {}, {}
             xml_bytes = z.read("word/numbering.xml")
     except Exception:
-        return {}
+        return {}, {}, {}
 
+    try:
+        root = etree.fromstring(xml_bytes)
+    except Exception:
+        return {}, {}, {}
+
+    ns = {"w": W_NS}
+
+    abstract_levels = {}
+    style_linked = {}
+    for abstract_el in root.findall("w:abstractNum", ns):
+        abstract_id = abstract_el.get(f"{{{W_NS}}}abstractNumId")
+        levels = {}
+        for lvl in abstract_el.findall("w:lvl", ns):
+            numfmt_el = lvl.find("w:numFmt", ns)
+            numfmt = numfmt_el.get(f"{{{W_NS}}}val") if numfmt_el is not None else "decimal"
+            if numfmt != "decimal":
+                continue
+            ilvl = int(lvl.get(f"{{{W_NS}}}ilvl", "0"))
+            start_el = lvl.find("w:start", ns)
+            start_val = int(start_el.get(f"{{{W_NS}}}val", "1")) if start_el is not None else 1
+            levels[ilvl] = {"start": start_val}
+
+            pstyle_el = lvl.find("w:pStyle", ns)
+            if pstyle_el is not None:
+                style_id = pstyle_el.get(f"{{{W_NS}}}val")
+                if style_id:
+                    style_linked[style_id] = {"ilvl": ilvl, "start": start_val}
+        if abstract_id is not None:
+            abstract_levels[abstract_id] = levels
+
+    num_to_abstract = {}
+    for num_el in root.findall("w:num", ns):
+        num_id = num_el.get(f"{{{W_NS}}}numId")
+        abstract_ref = num_el.find("w:abstractNumId", ns)
+        if num_id is not None and abstract_ref is not None:
+            num_to_abstract[num_id] = abstract_ref.get(f"{{{W_NS}}}val")
+
+    return num_to_abstract, abstract_levels, style_linked
+
+
+def _load_style_numpr(docx_path):
+    """Liest word/styles.xml und liefert {style_id: (numId, ilvl)} fuer
+    Formatvorlagen, die ihre eigene Numerierung direkt mitbringen (Weg 2:
+    <w:style><w:pPr><w:numPr>...). Liefert {} wenn nicht vorhanden/lesbar."""
+    try:
+        with zipfile.ZipFile(docx_path) as z:
+            if "word/styles.xml" not in z.namelist():
+                return {}
+            xml_bytes = z.read("word/styles.xml")
+    except Exception:
+        return {}
     try:
         root = etree.fromstring(xml_bytes)
     except Exception:
         return {}
 
     ns = {"w": W_NS}
-    style_map = {}
-    for lvl in root.findall(".//w:abstractNum/w:lvl", ns):
-        pstyle_el = lvl.find("w:pStyle", ns)
-        if pstyle_el is None:
-            continue
-        style_id = pstyle_el.get(f"{{{W_NS}}}val")
-        if not style_id:
-            continue
-        numfmt_el = lvl.find("w:numFmt", ns)
-        numfmt = numfmt_el.get(f"{{{W_NS}}}val") if numfmt_el is not None else "decimal"
-        if numfmt != "decimal":
-            continue
-        ilvl = int(lvl.get(f"{{{W_NS}}}ilvl", "0"))
-        start_el = lvl.find("w:start", ns)
-        start_val = int(start_el.get(f"{{{W_NS}}}val", "1")) if start_el is not None else 1
-        style_map[style_id] = {"ilvl": ilvl, "start": start_val}
-    return style_map
+    result = {}
+    for style_el in root.findall("w:style", ns):
+        style_id = style_el.get(f"{{{W_NS}}}styleId")
+        num_pr = style_el.find("w:pPr/w:numPr", ns)
+        if style_id and num_pr is not None:
+            num_id_el = num_pr.find("w:numId", ns)
+            ilvl_el = num_pr.find("w:ilvl", ns)
+            if num_id_el is not None:
+                num_id = num_id_el.get(f"{{{W_NS}}}val")
+                ilvl = int(ilvl_el.get(f"{{{W_NS}}}val", "0")) if ilvl_el is not None else 0
+                if num_id:
+                    result[style_id] = (num_id, ilvl)
+    return result
+
+
+def _paragraph_numpr(paragraph):
+    """Liefert (numId, ilvl) aus dem DIREKT am Absatz gesetzten <w:numPr>
+    (Weg 1), oder None wenn der Absatz keine eigene Numerierung traegt."""
+    try:
+        num_pr = paragraph._p.find(f"{{{W_NS}}}pPr/{{{W_NS}}}numPr")
+    except Exception:
+        return None
+    if num_pr is None:
+        return None
+    num_id_el = num_pr.find(f"{{{W_NS}}}numId")
+    if num_id_el is None:
+        return None
+    num_id = num_id_el.get(f"{{{W_NS}}}val")
+    ilvl_el = num_pr.find(f"{{{W_NS}}}ilvl")
+    ilvl = int(ilvl_el.get(f"{{{W_NS}}}val", "0")) if ilvl_el is not None else 0
+    return (num_id, ilvl) if num_id else None
 
 
 class _HeadingNumberer:
-    """Bildet Words Zaehllogik fuer formatvorlagen-verknuepfte Nummerierung
+    """Bildet Words Zaehllogik fuer automatisch numerierte Ueberschriften
     nach: pro Ebene hochzaehlen, tiefere Ebenen zuruecksetzen sobald eine
-    flachere Ebene erneut auftritt. Liefert None fuer Absaetze, deren Style
-    nicht Teil der Nummerierung ist."""
+    flachere Ebene erneut auftritt. Deckt alle drei Verknuepfungswege ab
+    (Absatz direkt, Formatvorlage, "mit Formatvorlage verknuepft" in
+    numbering.xml) - Prioritaet in dieser Reihenfolge, wie bei Word selbst."""
 
-    def __init__(self, style_numbering):
-        self.style_numbering = style_numbering
-        self.counters = {}  # ilvl -> aktueller Zaehlerstand
+    def __init__(self, num_to_abstract, abstract_levels, style_numpr, style_linked):
+        self.num_to_abstract = num_to_abstract
+        self.abstract_levels = abstract_levels
+        self.style_numpr = style_numpr
+        self.style_linked = style_linked
+        self.counters = {}  # (abstractNumId) -> {ilvl: aktueller Zaehlerstand}
 
-    def number_for_style(self, style_id):
-        info = self.style_numbering.get(style_id)
-        if info is None:
-            return None
-        ilvl = info["ilvl"]
-        if ilvl in self.counters:
-            self.counters[ilvl] += 1
+    def _level_info(self, num_id, ilvl):
+        abstract_id = self.num_to_abstract.get(num_id)
+        if abstract_id is None:
+            return None, None
+        info = self.abstract_levels.get(abstract_id, {}).get(ilvl)
+        return abstract_id, info
+
+    def number_for_paragraph(self, paragraph):
+        style_id = _style_id(paragraph)
+
+        # Weg 1: Numerierung direkt am Absatz
+        direct = _paragraph_numpr(paragraph)
+        if direct is not None:
+            num_id, ilvl = direct
+            abstract_id, info = self._level_info(num_id, ilvl)
+            if info is not None:
+                return self._advance(abstract_id, ilvl, info["start"])
+
+        # Weg 2: Numerierung an der Formatvorlage selbst
+        if style_id and style_id in self.style_numpr:
+            num_id, ilvl = self.style_numpr[style_id]
+            abstract_id, info = self._level_info(num_id, ilvl)
+            if info is not None:
+                return self._advance(abstract_id, ilvl, info["start"])
+
+        # Weg 3: "Mit Formatvorlage verknuepft" in numbering.xml
+        if style_id and style_id in self.style_linked:
+            entry = self.style_linked[style_id]
+            # Eigener, von den anderen beiden Wegen getrennter Zaehler-Namensraum,
+            # da hier keine echte abstractNumId als Schluessel vorliegt.
+            return self._advance(f"_stylelinked_{style_id}", entry["ilvl"], entry["start"],
+                                  use_style_key=True)
+
+        return None
+
+    def _advance(self, counter_key, ilvl, start, use_style_key=False):
+        counters = self.counters.setdefault(counter_key, {})
+        if ilvl in counters:
+            counters[ilvl] += 1
         else:
-            self.counters[ilvl] = info["start"]
-        for deeper in [l for l in self.counters if l > ilvl]:
-            del self.counters[deeper]
-        parts = [str(self.counters.get(l, 1)) for l in range(ilvl + 1)]
+            counters[ilvl] = start
+        for deeper in [l for l in counters if l > ilvl]:
+            del counters[deeper]
+        parts = [str(counters.get(l, 1)) for l in range(ilvl + 1)]
         return ".".join(parts)
 
 
@@ -238,8 +353,9 @@ def extract_chapters(docx_path):
     build_comparison), da echte Nummern zwischen Exportversionen fehlen koennen.
     """
     doc = Document(docx_path)
-    style_numbering = _load_style_numbering(docx_path)
-    numberer = _HeadingNumberer(style_numbering)
+    num_to_abstract, abstract_levels, style_linked = _load_numbering_definitions(docx_path)
+    style_numpr = _load_style_numpr(docx_path)
+    numberer = _HeadingNumberer(num_to_abstract, abstract_levels, style_numpr, style_linked)
 
     chapters = []
     current = None
@@ -290,11 +406,12 @@ def extract_chapters(docx_path):
         # gerade erst erzeugten Fallback-Kapitel (das dann als "_N" ans Ende
         # sortiert wird) statt im tatsaechlichen, gerade begonnenen Kapitel.
 
-        # Formatvorlagen-verknuepfte automatische Nummerierung hat Vorrang:
-        # wenn dieser Absatz-Style Teil einer numerierten Ueberschriften-Kette
-        # ist (z.B. "Heading1"/"Heading2"), ist die Zahl im Text selbst NICHT
-        # vorhanden und muss hier rekonstruiert werden.
-        auto_number = numberer.number_for_style(_style_id(para))
+        # Automatische Kapitel-Nummerierung hat Vorrang: wenn dieser Absatz
+        # (direkt, ueber seine Formatvorlage, oder ueber eine "mit
+        # Formatvorlage verknuepfte" Listendefinition) Teil einer numerierten
+        # Kette ist, steht die Zahl im Text selbst NICHT und muss hier
+        # rekonstruiert werden.
+        auto_number = numberer.number_for_paragraph(para)
         if auto_number is not None:
             pending_numbers.clear()
             new_chapter(auto_number, source="heading_auto")

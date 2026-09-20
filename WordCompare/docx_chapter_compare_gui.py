@@ -1,16 +1,23 @@
 #!/usr/bin/env python3
 """
 docx_chapter_compare_gui.py
-Version 2.1 / 2026-09-20 / Grund: Bugfix - "Wie soll diese Datei geoeffnet
-    werden?"-Dialog (Windows zeigt Apps wie Editor/Paint/Gimp statt direkt
-    einen Browser zu starten) auf Rechnern ohne gesetzte .html-Dateizuordnung
-    (typisch bei restriktiv konfigurierten Firmenrechnern). webbrowser.open()
-    verliess sich bisher blind auf diese Windows-Zuordnung. Neue Funktion
-    open_in_browser() probiert zuerst bekannte Browser-Installationspfade
-    (Edge/Chrome/Firefox) direkt per Programmaufruf, umgeht damit die
-    Windows-Dateizuordnung komplett - faellt erst danach auf
-    webbrowser.open() zurueck. Zeigt zusaetzlich eine Meldung mit Dateipfad,
-    falls gar kein Browser automatisch gestartet werden konnte.
+Version 2.3 / 2026-09-20 / Grund: Wichtiger Bugfix (Nutzer bestaetigte: auch
+    eine unveraenderte alte Version zeigt inzwischen dasselbe Problem - also
+    eine Umgebungsaenderung auf dem Rechner, kein Code-Bug) - manche
+    (v.a. streng konfigurierte Firmen-)Rechner behandeln lokale file://-
+    Dateien aus Sicherheitsgruenden anders als normale Webseiten und zeigen
+    HTML nur als Rohtext statt gerendert an. open_in_browser() startet jetzt
+    zuerst einen minimalen lokalen HTTP-Server (NUR 127.0.0.1, zufaelliger
+    Port) und oeffnet den Bericht ueber http://127.0.0.1:PORT/... statt
+    file://, was diese Einschraenkung umgeht (echter Content-Type-Header
+    text/html statt Datei-Endungs-Raten). Aus Sicherheitsgruenden (ggf.
+    vertrauliche Dokumente im selben Ordner wie der Bericht) wird NICHT der
+    komplette Ausgabeordner ausgeliefert, sondern die Report-Datei zuvor in
+    ein frisches, isoliertes Temp-Verzeichnis kopiert - der Server liefert
+    ausschliesslich diese eine Datei aus (mit echtem Request getestet:
+    Verzeichnis-Traversal auf das Elternverzeichnis schlaegt fehl/liefert
+    nur die eigene Datei). Faellt bei Fehlschlag weiterhin auf file:// +
+    Registry-/Pfad-Suche + Windows-Standard zurueck wie in v2.2.
 
 Desktop-GUI (Tkinter, keine Zusatz-Installation noetig) fuer den
 Kapitelvergleich zweier Word-Dokumente. Nutzt dieselbe Vergleichslogik und
@@ -36,7 +43,7 @@ import webbrowser
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-GUI_VERSION = "2.1"
+GUI_VERSION = "2.3"
 
 try:
     import docx_chapter_compare as _core
@@ -83,8 +90,11 @@ def default_output_dir():
 # konfigurierte Firmen-)Rechner haben keine .html-Dateizuordnung gesetzt;
 # webbrowser.open() loest dann ueber die Windows-Shell auf und zeigt den
 # "Wie soll diese Datei geoeffnet werden?"-Dialog mit Apps wie Editor/Paint/
-# Gimp statt direkt einen Browser zu starten. Ein direkt gestarteter Browser
-# umgeht diese Zuordnung komplett.
+# Gimp (oder faellt auf einen veralteten Internet Explorer als Standard-App
+# zurueck, der lokale HTML-Dateien teils nur als Rohtext statt gerendert
+# anzeigt) statt direkt einen modernen Browser zu starten. Ein direkt
+# gestarteter Browser umgeht diese Zuordnung komplett.
+_BROWSER_EXE_NAMES = ["msedge.exe", "chrome.exe", "firefox.exe"]
 _BROWSER_CANDIDATES = [
     r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe",
     r"%ProgramFiles%\Microsoft\Edge\Application\msedge.exe",
@@ -96,26 +106,112 @@ _BROWSER_CANDIDATES = [
 ]
 
 
+def _find_browser_via_registry():
+    """Fragt Windows selbst (App Paths-Registrierung) nach dem tatsaechlichen
+    Installationsort von Edge/Chrome/Firefox - das ist der Mechanismus, den
+    Windows intern auch benutzt, und findet Browser zuverlaessiger als
+    geratene Standardpfade (z.B. bei individuell konfigurierten
+    Firmenrechnern, benutzerspezifischen statt systemweiten Installationen,
+    o.ae.). Gibt den ersten gefundenen Pfad zurueck, oder None."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import winreg
+    except ImportError:
+        return None
+    for exe_name in _BROWSER_EXE_NAMES:
+        key_path = rf"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\{exe_name}"
+        for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+            try:
+                with winreg.OpenKey(hive, key_path) as key:
+                    path, _ = winreg.QueryValueEx(key, "")
+                    if path and Path(path).exists():
+                        return path
+            except (FileNotFoundError, OSError):
+                continue
+    return None
+
+
+def _start_local_server(source_file):
+    """Startet einen minimalen lokalen HTTP-Server (NUR auf 127.0.0.1,
+    zufaelliger freier Port) im Hintergrund. Manche (v.a. streng
+    konfigurierte Firmen-)Rechner behandeln lokale file://-Dateien aus
+    Sicherheitsgruenden anders als normale Webseiten - z.B. wird HTML dann
+    nur als Rohtext angezeigt statt gerendert (beobachtet: aendert sich auf
+    einem Rechner im Zeitverlauf durch ein Windows-/Edge-Update oder eine
+    IT-Richtlinie, unabhaengig von diesem Skript). Ueber einen echten - wenn
+    auch rein lokalen, nach aussen nicht erreichbaren - HTTP-Server umgeht
+    man file://-spezifische Einschraenkungen komplett.
+
+    WICHTIG (Sicherheit): Liefert NICHT den kompletten Ordner der Report-
+    Datei aus (der koennte z.B. der Documents-Ordner mit anderen, ggf.
+    vertraulichen Dateien sein) - stattdessen wird die Report-Datei in ein
+    frisches, temporaeres Verzeichnis kopiert und NUR das ausgeliefert.
+    Selbst wenn ein anderer lokaler Prozess den Server abfragen wuerde,
+    kaeme er nur an genau die eine Datei, die ohnehin gleich im Browser
+    angezeigt wird - nicht an den Rest des Ordners.
+
+    Gibt (port, temp_dir) zurueck, oder (None, None) wenn nicht gestartet
+    werden konnte."""
+    try:
+        import functools
+        import http.server
+        import shutil
+        import tempfile
+    except ImportError:
+        return None, None
+    try:
+        temp_dir = tempfile.mkdtemp(prefix="docx_compare_view_")
+        shutil.copy2(source_file, Path(temp_dir) / source_file.name)
+        handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=temp_dir)
+        httpd = http.server.HTTPServer(("127.0.0.1", 0), handler)
+        port = httpd.server_address[1]
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        return port, temp_dir
+    except Exception:
+        return None, None
+
+
 def open_in_browser(path):
-    """Oeffnet eine Datei in einem echten Browser - probiert zuerst bekannte
-    Browser-Installationspfade direkt per Programmaufruf, statt sich auf die
-    Windows-Dateizuordnung (webbrowser.open()) zu verlassen. Faellt erst
-    danach auf webbrowser.open() zurueck (z.B. auf Nicht-Windows-Systemen)."""
-    uri = path.resolve().as_uri()
+    """Oeffnet eine Datei in einem echten Browser. Reihenfolge:
+    (1) ueber einen lokalen Mini-HTTP-Server (http://127.0.0.1:PORT/...) -
+        das ist der ROBUSTESTE Weg, da manche Firmenrechner file://-Inhalte
+        speziell einschraenken/nur als Rohtext anzeigen, http://-Inhalte
+        aber normal behandeln;
+    (2) falls der Server nicht gestartet werden konnte: direkt per file://,
+        ueber Windows' eigene App-Paths-Registrierung (am zuverlaessigsten)
+        oder bekannte Standard-Installationspfade;
+    (3) als letzter Ausweg: webbrowser.open() (Windows-Dateizuordnung).
+    Gibt (erfolg: bool, methode: str) zurueck, damit der Aufrufer sichtbar
+    machen kann, WELCHER Weg gegriffen hat."""
+    server_port, _server_temp_dir = _start_local_server(path)
+    if server_port is not None:
+        url = f"http://127.0.0.1:{server_port}/{path.name}"
+    else:
+        url = path.resolve().as_uri()
+
     if sys.platform == "win32":
+        registry_hit = _find_browser_via_registry()
+        if registry_hit:
+            try:
+                subprocess.Popen([registry_hit, url])
+                return True, ("server" if server_port else "registry")
+            except Exception:
+                pass
         for template in _BROWSER_CANDIDATES:
             exe = os.path.expandvars(template)
             if Path(exe).exists():
                 try:
-                    subprocess.Popen([exe, uri])
-                    return True
+                    subprocess.Popen([exe, url])
+                    return True, ("server" if server_port else "candidate_path")
                 except Exception:
                     continue
     try:
-        webbrowser.open(uri)
-        return True
+        webbrowser.open(url)
+        return True, ("server" if server_port else "os_default")
     except Exception:
-        return False
+        return False, "failed"
 
 
 def load_config():
@@ -395,12 +491,22 @@ class CompareApp(tk.Tk):
                 f"Neu: {stats['new']}   Gelöscht: {stats['deleted']}"
             )
         )
-        opened = open_in_browser(out_path)
+        opened, method = open_in_browser(out_path)
         if not opened:
             messagebox.showinfo(
                 "Bericht bereit",
                 f"Der Bericht wurde erstellt, konnte aber nicht automatisch geöffnet werden:\n\n"
                 f"{out_path}\n\nBitte die Datei manuell doppelklicken oder in einen Browser ziehen.",
+            )
+        elif method == "os_default":
+            messagebox.showwarning(
+                "Bericht geöffnet über Windows-Standard",
+                "Weder über die Windows-Registrierung noch über bekannte Installationspfade "
+                "konnte Edge/Chrome/Firefox gefunden werden. Der Bericht wurde stattdessen über "
+                "die Windows-Standardzuordnung geöffnet - falls sich dabei ein alter/falscher "
+                "Browser (z.B. Internet Explorer) geöffnet hat und die Seite nur als Rohtext "
+                "zeigt, bitte die Datei manuell mit Edge/Chrome öffnen:\n\n"
+                f"{out_path}",
             )
 
     def _on_error(self, exc):

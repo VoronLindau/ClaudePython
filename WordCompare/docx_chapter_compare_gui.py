@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
 """
 docx_chapter_compare_gui.py
-Version 1.9 / 2026-09-05 / Grund: detect_possible_moves() liefert jetzt
-    (moves, complete) statt nur moves (siehe docx_chapter_compare.py v2.7,
-    Zeitbudget-Schutz gegen sehr lange Laufzeiten bei vielen Aenderungen) -
-    GUI angepasst, zeigt Warnhinweis bei unvollstaendiger Erkennung.
+Version 2.1 / 2026-09-20 / Grund: Bugfix - "Wie soll diese Datei geoeffnet
+    werden?"-Dialog (Windows zeigt Apps wie Editor/Paint/Gimp statt direkt
+    einen Browser zu starten) auf Rechnern ohne gesetzte .html-Dateizuordnung
+    (typisch bei restriktiv konfigurierten Firmenrechnern). webbrowser.open()
+    verliess sich bisher blind auf diese Windows-Zuordnung. Neue Funktion
+    open_in_browser() probiert zuerst bekannte Browser-Installationspfade
+    (Edge/Chrome/Firefox) direkt per Programmaufruf, umgeht damit die
+    Windows-Dateizuordnung komplett - faellt erst danach auf
+    webbrowser.open() zurueck. Zeigt zusaetzlich eine Meldung mit Dateipfad,
+    falls gar kein Browser automatisch gestartet werden konnte.
 
 Desktop-GUI (Tkinter, keine Zusatz-Installation noetig) fuer den
 Kapitelvergleich zweier Word-Dokumente. Nutzt dieselbe Vergleichslogik und
@@ -21,6 +27,8 @@ Diese Datei muss im selben Ordner liegen wie docx_chapter_compare.py.
 """
 
 import json
+import os
+import subprocess
 import sys
 import threading
 import tkinter as tk
@@ -28,7 +36,7 @@ import webbrowser
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-GUI_VERSION = "1.9"
+GUI_VERSION = "2.1"
 
 try:
     import docx_chapter_compare as _core
@@ -62,6 +70,54 @@ print(f"docx_chapter_compare.py     Version {CORE_VERSION} ({CORE_PATH})")
 CONFIG_PATH = Path.home() / ".docx_chapter_compare_gui.json"
 
 
+def default_output_dir():
+    """Documents-Ordner, falls vorhanden - sonst Fallback aufs Home-Verzeichnis.
+    Vermeidet, Report-Dateien direkt ins Profil-Root (C:\\Users\\<Name>\\) zu
+    kippen, was auf Windows unueblich/unaufgeraeumt wirkt."""
+    docs = Path.home() / "Documents"
+    return docs if docs.is_dir() else Path.home()
+
+
+# Bekannte Installationspfade gaengiger Browser (Windows) - werden VOR der
+# Windows-Dateizuordnung probiert. Grund: manche (v.a. restriktiv
+# konfigurierte Firmen-)Rechner haben keine .html-Dateizuordnung gesetzt;
+# webbrowser.open() loest dann ueber die Windows-Shell auf und zeigt den
+# "Wie soll diese Datei geoeffnet werden?"-Dialog mit Apps wie Editor/Paint/
+# Gimp statt direkt einen Browser zu starten. Ein direkt gestarteter Browser
+# umgeht diese Zuordnung komplett.
+_BROWSER_CANDIDATES = [
+    r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe",
+    r"%ProgramFiles%\Microsoft\Edge\Application\msedge.exe",
+    r"%ProgramFiles%\Google\Chrome\Application\chrome.exe",
+    r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe",
+    r"%LocalAppData%\Google\Chrome\Application\chrome.exe",
+    r"%ProgramFiles%\Mozilla Firefox\firefox.exe",
+    r"%ProgramFiles(x86)%\Mozilla Firefox\firefox.exe",
+]
+
+
+def open_in_browser(path):
+    """Oeffnet eine Datei in einem echten Browser - probiert zuerst bekannte
+    Browser-Installationspfade direkt per Programmaufruf, statt sich auf die
+    Windows-Dateizuordnung (webbrowser.open()) zu verlassen. Faellt erst
+    danach auf webbrowser.open() zurueck (z.B. auf Nicht-Windows-Systemen)."""
+    uri = path.resolve().as_uri()
+    if sys.platform == "win32":
+        for template in _BROWSER_CANDIDATES:
+            exe = os.path.expandvars(template)
+            if Path(exe).exists():
+                try:
+                    subprocess.Popen([exe, uri])
+                    return True
+                except Exception:
+                    continue
+    try:
+        webbrowser.open(uri)
+        return True
+    except Exception:
+        return False
+
+
 def load_config():
     try:
         return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
@@ -88,7 +144,7 @@ class CompareApp(tk.Tk):
 
         self.var_a = tk.StringVar(value=self.cfg.get("doc_a", ""))
         self.var_b = tk.StringVar(value=self.cfg.get("doc_b", ""))
-        self.var_out = tk.StringVar(value=self.cfg.get("out", str(Path.home() / "vergleich.html")))
+        self.var_out = tk.StringVar(value=self.cfg.get("out", str(default_output_dir() / "vergleich.html")))
         self.var_status = tk.StringVar(value="Bereit.")
         self.var_ignore_linebreaks = tk.BooleanVar(value=self.cfg.get("ignore_linebreaks", True))
         self.var_detect_pages = tk.BooleanVar(value=self.cfg.get("detect_pages", True))
@@ -204,7 +260,7 @@ class CompareApp(tk.Tk):
     def run_compare(self):
         path_a = Path(self.var_a.get().strip())
         path_b = Path(self.var_b.get().strip())
-        out_path = Path(self.var_out.get().strip() or (Path.home() / "vergleich.html"))
+        out_path = Path(self.var_out.get().strip() or (default_output_dir() / "vergleich.html"))
 
         if not self.var_a.get().strip() or not self.var_b.get().strip():
             messagebox.showwarning("Fehlende Angabe", "Bitte beide Dokumente auswählen.")
@@ -339,7 +395,13 @@ class CompareApp(tk.Tk):
                 f"Neu: {stats['new']}   Gelöscht: {stats['deleted']}"
             )
         )
-        webbrowser.open(out_path.resolve().as_uri())
+        opened = open_in_browser(out_path)
+        if not opened:
+            messagebox.showinfo(
+                "Bericht bereit",
+                f"Der Bericht wurde erstellt, konnte aber nicht automatisch geöffnet werden:\n\n"
+                f"{out_path}\n\nBitte die Datei manuell doppelklicken oder in einen Browser ziehen.",
+            )
 
     def _on_error(self, exc):
         self.btn_compare.config(state="normal")

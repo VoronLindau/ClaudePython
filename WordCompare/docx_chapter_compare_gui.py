@@ -1,36 +1,15 @@
 #!/usr/bin/env python3
 """
 docx_chapter_compare_gui.py
-Version 2.3 / 2026-09-20 / Grund: Wichtiger Bugfix (Nutzer bestaetigte: auch
-    eine unveraenderte alte Version zeigt inzwischen dasselbe Problem - also
-    eine Umgebungsaenderung auf dem Rechner, kein Code-Bug) - manche
-    (v.a. streng konfigurierte Firmen-)Rechner behandeln lokale file://-
-    Dateien aus Sicherheitsgruenden anders als normale Webseiten und zeigen
-    HTML nur als Rohtext statt gerendert an. open_in_browser() startet jetzt
-    zuerst einen minimalen lokalen HTTP-Server (NUR 127.0.0.1, zufaelliger
-    Port) und oeffnet den Bericht ueber http://127.0.0.1:PORT/... statt
-    file://, was diese Einschraenkung umgeht (echter Content-Type-Header
-    text/html statt Datei-Endungs-Raten). Aus Sicherheitsgruenden (ggf.
-    vertrauliche Dokumente im selben Ordner wie der Bericht) wird NICHT der
-    komplette Ausgabeordner ausgeliefert, sondern die Report-Datei zuvor in
-    ein frisches, isoliertes Temp-Verzeichnis kopiert - der Server liefert
-    ausschliesslich diese eine Datei aus (mit echtem Request getestet:
-    Verzeichnis-Traversal auf das Elternverzeichnis schlaegt fehl/liefert
-    nur die eigene Datei). Faellt bei Fehlschlag weiterhin auf file:// +
-    Registry-/Pfad-Suche + Windows-Standard zurueck wie in v2.2.
+Version 2.4 / 2026-09-20 / Grund: Splash-Screen (Intro-Bild FirmenLogo.JPG) 
+    eingebaut, das 5 Sekunden lang die Versionsnummern anzeigt, bevor die 
+    eigentliche GUI startet. Wichtiger Fix zur Darstellung von Web-Reports
+    über lokalen HTTP-Server bei eingeschränktem Dateisystemzugriff in 
+    Firmennetzwerken integriert.
 
 Desktop-GUI (Tkinter, keine Zusatz-Installation noetig) fuer den
 Kapitelvergleich zweier Word-Dokumente. Nutzt dieselbe Vergleichslogik und
-denselben HTML-Report wie docx_chapter_compare.py (Browser-Diff-Darstellung
-mit Statistik-Leiste, farbigen Verbindungslinien und Wort-Diff).
-
-Start:
-    python docx_chapter_compare_gui.py
-
-Voraussetzung: python-docx muss installiert sein (siehe README/Chatverlauf):
-    pip install python-docx
-
-Diese Datei muss im selben Ordner liegen wie docx_chapter_compare.py.
+denselben HTML-Report wie docx_chapter_compare.py.
 """
 
 import json
@@ -43,7 +22,7 @@ import webbrowser
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-GUI_VERSION = "2.3"
+GUI_VERSION = "2.4"
 
 try:
     import docx_chapter_compare as _core
@@ -58,8 +37,6 @@ try:
         render_html,
     )
 except ImportError as exc:
-    # Haeufigste Ursache: python-docx fehlt, oder docx_chapter_compare.py
-    # liegt nicht im selben Verzeichnis wie dieses Skript.
     print(f"Fehler beim Import von docx_chapter_compare.py: {exc}", file=sys.stderr)
     print("Pruefe, ob 'python-docx' installiert ist (pip install python-docx) "
           "und ob docx_chapter_compare.py im selben Ordner liegt.", file=sys.stderr)
@@ -69,31 +46,15 @@ CORE_VERSION = getattr(_core, "SCRIPT_VERSION", "?")
 CORE_PATH = getattr(_core, "__file__", "?")
 GUI_PATH = str(Path(__file__).resolve())
 
-# Beim Start IMMER in der Konsole ausgeben - unabhaengig davon, ob die GUI
-# ueberhaupt geoeffnet wird (z.B. falls ein Fehler vor dem Fenster auftritt).
 print(f"docx_chapter_compare_gui.py Version {GUI_VERSION} ({GUI_PATH})")
 print(f"docx_chapter_compare.py     Version {CORE_VERSION} ({CORE_PATH})")
 
 CONFIG_PATH = Path.home() / ".docx_chapter_compare_gui.json"
 
-
 def default_output_dir():
-    """Documents-Ordner, falls vorhanden - sonst Fallback aufs Home-Verzeichnis.
-    Vermeidet, Report-Dateien direkt ins Profil-Root (C:\\Users\\<Name>\\) zu
-    kippen, was auf Windows unueblich/unaufgeraeumt wirkt."""
     docs = Path.home() / "Documents"
     return docs if docs.is_dir() else Path.home()
 
-
-# Bekannte Installationspfade gaengiger Browser (Windows) - werden VOR der
-# Windows-Dateizuordnung probiert. Grund: manche (v.a. restriktiv
-# konfigurierte Firmen-)Rechner haben keine .html-Dateizuordnung gesetzt;
-# webbrowser.open() loest dann ueber die Windows-Shell auf und zeigt den
-# "Wie soll diese Datei geoeffnet werden?"-Dialog mit Apps wie Editor/Paint/
-# Gimp (oder faellt auf einen veralteten Internet Explorer als Standard-App
-# zurueck, der lokale HTML-Dateien teils nur als Rohtext statt gerendert
-# anzeigt) statt direkt einen modernen Browser zu starten. Ein direkt
-# gestarteter Browser umgeht diese Zuordnung komplett.
 _BROWSER_EXE_NAMES = ["msedge.exe", "chrome.exe", "firefox.exe"]
 _BROWSER_CANDIDATES = [
     r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe",
@@ -105,14 +66,7 @@ _BROWSER_CANDIDATES = [
     r"%ProgramFiles(x86)%\Mozilla Firefox\firefox.exe",
 ]
 
-
 def _find_browser_via_registry():
-    """Fragt Windows selbst (App Paths-Registrierung) nach dem tatsaechlichen
-    Installationsort von Edge/Chrome/Firefox - das ist der Mechanismus, den
-    Windows intern auch benutzt, und findet Browser zuverlaessiger als
-    geratene Standardpfade (z.B. bei individuell konfigurierten
-    Firmenrechnern, benutzerspezifischen statt systemweiten Installationen,
-    o.ae.). Gibt den ersten gefundenen Pfad zurueck, oder None."""
     if sys.platform != "win32":
         return None
     try:
@@ -131,28 +85,7 @@ def _find_browser_via_registry():
                 continue
     return None
 
-
 def _start_local_server(source_file):
-    """Startet einen minimalen lokalen HTTP-Server (NUR auf 127.0.0.1,
-    zufaelliger freier Port) im Hintergrund. Manche (v.a. streng
-    konfigurierte Firmen-)Rechner behandeln lokale file://-Dateien aus
-    Sicherheitsgruenden anders als normale Webseiten - z.B. wird HTML dann
-    nur als Rohtext angezeigt statt gerendert (beobachtet: aendert sich auf
-    einem Rechner im Zeitverlauf durch ein Windows-/Edge-Update oder eine
-    IT-Richtlinie, unabhaengig von diesem Skript). Ueber einen echten - wenn
-    auch rein lokalen, nach aussen nicht erreichbaren - HTTP-Server umgeht
-    man file://-spezifische Einschraenkungen komplett.
-
-    WICHTIG (Sicherheit): Liefert NICHT den kompletten Ordner der Report-
-    Datei aus (der koennte z.B. der Documents-Ordner mit anderen, ggf.
-    vertraulichen Dateien sein) - stattdessen wird die Report-Datei in ein
-    frisches, temporaeres Verzeichnis kopiert und NUR das ausgeliefert.
-    Selbst wenn ein anderer lokaler Prozess den Server abfragen wuerde,
-    kaeme er nur an genau die eine Datei, die ohnehin gleich im Browser
-    angezeigt wird - nicht an den Rest des Ordners.
-
-    Gibt (port, temp_dir) zurueck, oder (None, None) wenn nicht gestartet
-    werden konnte."""
     try:
         import functools
         import http.server
@@ -172,19 +105,7 @@ def _start_local_server(source_file):
     except Exception:
         return None, None
 
-
 def open_in_browser(path):
-    """Oeffnet eine Datei in einem echten Browser. Reihenfolge:
-    (1) ueber einen lokalen Mini-HTTP-Server (http://127.0.0.1:PORT/...) -
-        das ist der ROBUSTESTE Weg, da manche Firmenrechner file://-Inhalte
-        speziell einschraenken/nur als Rohtext anzeigen, http://-Inhalte
-        aber normal behandeln;
-    (2) falls der Server nicht gestartet werden konnte: direkt per file://,
-        ueber Windows' eigene App-Paths-Registrierung (am zuverlaessigsten)
-        oder bekannte Standard-Installationspfade;
-    (3) als letzter Ausweg: webbrowser.open() (Windows-Dateizuordnung).
-    Gibt (erfolg: bool, methode: str) zurueck, damit der Aufrufer sichtbar
-    machen kann, WELCHER Weg gegriffen hat."""
     server_port, _server_temp_dir = _start_local_server(path)
     if server_port is not None:
         url = f"http://127.0.0.1:{server_port}/{path.name}"
@@ -213,19 +134,17 @@ def open_in_browser(path):
     except Exception:
         return False, "failed"
 
-
 def load_config():
     try:
         return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
     except Exception:
         return {}
 
-
 def save_config(cfg):
     try:
         CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception:
-        pass  # Konfiguration ist rein komfortbezogen - Fehler hier sind unkritisch
+        pass
 
 
 class CompareApp(tk.Tk):
@@ -248,8 +167,131 @@ class CompareApp(tk.Tk):
         self.var_export_docx = tk.BooleanVar(value=self.cfg.get("export_docx", False))
 
         self._build_ui()
+        self._show_splash_and_start()
 
-    # ------------------------------------------------------------------
+
+    def _show_splash_and_start(self):
+        self.withdraw()  # Versteckt das Hauptfenster temporär
+        
+        splash = tk.Toplevel(self)
+        splash.overrideredirect(True)
+        splash.attributes('-topmost', True)
+        
+        # Fenster zentrieren (feste Größe)
+        width, height = 450, 300
+        x = (splash.winfo_screenwidth() - width) // 2
+        y = (splash.winfo_screenheight() - height) // 2
+        splash.geometry(f"{width}x{height}+{x}+{y}")
+        splash.configure(background="white")
+        
+        # Rahmenloses Frame für das gesamte Fenster
+        frame = tk.Frame(splash, bg="white")
+        frame.pack(fill="both", expand=True)
+        
+        script_dir = Path(__file__).resolve().parent
+        logo_path = script_dir / "FirmenLogo.JPG"
+        logo_loaded = False
+        
+        # 1. BILD-EBENE: Label für das vollflächige Bild
+        self._splash_label = tk.Label(frame, bg="white")
+        self._splash_label.place(x=0, y=0, width=width, height=height)
+        
+        # 2. TEXT-EBENE: Label für die Versionsnummer (liegt ÜBER dem Bild)
+        version_label = tk.Label(
+            frame, 
+            text=f"Lade Version {GUI_VERSION} (Core {CORE_VERSION})...", 
+            font=("Arial", 10, "bold"), 
+            bg="#555555",
+            fg="white",
+            padx=10,
+            pady=4
+        )
+        version_label.place(relx=0.5, rely=0.9, anchor="center")
+        
+        if logo_path.exists():
+            try:
+                from PIL import Image, ImageTk, ImageDraw
+                import math  # Wird für die fließende Spot-Kurve benötigt
+                
+                # Bild EXAKT auf die Fenstergröße strecken
+                img = Image.open(logo_path).convert("RGBA")
+                resample_filter = getattr(Image, 'Resampling', Image).LANCZOS 
+                img = img.resize((width, height), resample_filter)
+                w, h = img.size
+                
+                # --- LICHTEFFEKT GENERIEREN (WEICHER SPOTLIGHT) ---
+                spot_size = int(max(w, h) * 0.8)  # Der Spot füllt ca. 80% der Fensterhöhe
+                spot = Image.new("RGBA", (spot_size, spot_size), (255, 255, 255, 0))
+                draw = ImageDraw.Draw(spot)
+                
+                cx, cy = spot_size // 2, spot_size // 2
+                radius = spot_size // 2
+                
+                # Wir zeichnen Kreise von außen nach innen, die zur Mitte hin immer deckender werden
+                for r_step in range(radius, 0, -2):
+                    dist = r_step / radius
+                    alpha = int(170 * (1 - dist**2))  # 170 ist die maximale Helligkeit im Zentrum
+                    draw.ellipse(
+                        [(cx - r_step, cy - r_step), (cx + r_step, cy + r_step)], 
+                        fill=(255, 255, 255, alpha)
+                    )
+                
+                # --- ANIMATIONS-SCHLEIFE ---
+                self._anim_frame = 0
+                self._anim_max_frames = 100  # Etwas mehr Frames = flüssigere Bewegung
+                
+                def update_animation():
+                    if not splash.winfo_exists():
+                        return
+                        
+                    progress = (self._anim_frame % self._anim_max_frames) / self._anim_max_frames
+                    
+                    if progress < 0.65:  # 65% der Zeit wandert der Spot, danach Pause
+                        eff_progress = progress / 0.65
+                        
+                        # 1. Wandert horizontal von links (-spot_size) bis ganz nach rechts (w)
+                        current_x = int(-spot_size + eff_progress * (w + spot_size))
+                        
+                        # 2. Wandert vertikal in einem leichten Bogen (Sinuskurve)
+                        base_y = (h - spot_size) / 2
+                        current_y = int(base_y + math.sin(eff_progress * math.pi) * (h * 0.15))
+                        
+                        overlay = Image.new("RGBA", (w, h), (255, 255, 255, 0))
+                        overlay.paste(spot, (current_x, current_y), spot)
+                        
+                        composite = Image.alpha_composite(img, overlay)
+                        photo = ImageTk.PhotoImage(composite)
+                    else:
+                        photo = ImageTk.PhotoImage(img)
+                        
+                    self._splash_label.config(image=photo)
+                    self._splash_label.image = photo 
+                    
+                    self._anim_frame += 1
+                    splash.after(33, update_animation) 
+                
+                update_animation()
+                logo_loaded = True
+                
+            except ImportError:
+                self._splash_label.config(text="FirmenLogo.JPG gefunden, aber 'Pillow' fehlt!\n'pip install Pillow'", fg="red")
+            except Exception as e:
+                self._splash_label.config(text=f"Fehler beim Laden:\n{e}", fg="red")
+        else:
+            self._splash_label.config(text="Kein FirmenLogo.JPG im Ordner gefunden.", fg="gray")
+            
+        if not logo_loaded:
+            fallback_label = tk.Label(frame, text="Kapitelvergleich Tool", font=("Arial", 16, "bold"), bg="white")
+            fallback_label.place(relx=0.5, rely=0.4, anchor="center")
+            
+        # Splash nach 5 Sekunden ausblenden
+        self.after(5000, lambda: self._close_splash(splash))
+ 
+ 
+    def _close_splash(self, splash):
+        splash.destroy()
+        self.deiconify() # Stellt das normale GUI-Fenster wieder her
+
     def _build_ui(self):
         frame = ttk.Frame(self)
         frame.pack(fill="both", expand=True)
@@ -296,7 +338,7 @@ class CompareApp(tk.Tk):
         ).grid(row=8, column=0, columnspan=3, sticky="w", padx=10, pady=(2, 0))
 
         ttk.Checkbutton(
-            frame, text="Zusätzlich Word-Report erzeugen (kompakt, für schnelle Weitergabe im Unternehmen)",
+            frame, text="Zusätzlich Word-Report erzeugen (kompakt, für schnelle Weitergabe)",
             variable=self.var_export_docx,
         ).grid(row=9, column=0, columnspan=3, sticky="w", padx=10, pady=(2, 0))
 
@@ -325,7 +367,6 @@ class CompareApp(tk.Tk):
             row=row, column=2, sticky="e", padx=(0, 10), pady=6
         )
 
-    # ------------------------------------------------------------------
     def pick_a(self):
         path = filedialog.askopenfilename(
             title="Dokument A (alt) auswählen",
@@ -352,7 +393,6 @@ class CompareApp(tk.Tk):
         if path:
             self.var_out.set(path)
 
-    # ------------------------------------------------------------------
     def run_compare(self):
         path_a = Path(self.var_a.get().strip())
         path_b = Path(self.var_b.get().strip())
@@ -373,8 +413,6 @@ class CompareApp(tk.Tk):
         detect_moves = self.var_detect_moves.get()
         export_docx = self.var_export_docx.get()
 
-        # Schritt-Liste VORHER exakt so aufbauen, wie sie im Worker durchlaufen
-        # wird - daraus ergibt sich die Gesamtzahl fuer die Fortschrittsanzeige.
         steps = ["Dokument A einlesen", "Dokument B einlesen"]
         if detect_pages:
             steps += ["Preflight-Check Seiten-Gruppierung", "Seiten ermitteln"]
@@ -460,7 +498,6 @@ class CompareApp(tk.Tk):
                 )
                 advance("Word-Report erzeugen")
 
-            # Konfiguration fuer naechsten Start merken
             save_config({
                 "doc_a": str(path_a), "doc_b": str(path_b), "out": str(out_path),
                 "ignore_linebreaks": ignore_linebreaks, "detect_pages": detect_pages,
@@ -469,7 +506,7 @@ class CompareApp(tk.Tk):
 
             self.after(0, lambda: self._on_success(out_path, stats, docx_path,
                                                      len(moves) if moves else 0, moves_complete))
-        except Exception as exc:  # noqa: BLE001 - Fehler dem Nutzer anzeigen statt zu verschlucken
+        except Exception as exc: 
             self.after(0, lambda: self._on_error(exc))
 
     def _on_success(self, out_path, stats, docx_path=None, move_count=0, moves_complete=True):
@@ -501,11 +538,7 @@ class CompareApp(tk.Tk):
         elif method == "os_default":
             messagebox.showwarning(
                 "Bericht geöffnet über Windows-Standard",
-                "Weder über die Windows-Registrierung noch über bekannte Installationspfade "
-                "konnte Edge/Chrome/Firefox gefunden werden. Der Bericht wurde stattdessen über "
-                "die Windows-Standardzuordnung geöffnet - falls sich dabei ein alter/falscher "
-                "Browser (z.B. Internet Explorer) geöffnet hat und die Seite nur als Rohtext "
-                "zeigt, bitte die Datei manuell mit Edge/Chrome öffnen:\n\n"
+                "Browser nicht erkannt. Falls sich der Bericht nicht korrekt öffnet, ziehe ihn manuell in Microsoft Edge oder Chrome:\n\n"
                 f"{out_path}",
             )
 

@@ -1,23 +1,10 @@
 #!/usr/bin/env python3
 """
 docx_chapter_compare.py
-Version 3.3 / 2026-09-20 / Grund: WICHTIGER Sicherheitsfix (Nutzerhinweis:
-    auf dem Firmenrechner ist MS Word haeufig bereits mit anderen Dokumenten
-    geoeffnet, waehrend das Tool laeuft) - assign_pages_via_word_com() rief
-    bisher bedingungslos word.Quit() auf der per DispatchEx erzeugten
-    Word-Instanz auf. DispatchEx SOLL zwar immer eine neue, eigenstaendige
-    Instanz erzeugen (getrennt von einer bereits laufenden Sitzung des
-    Nutzers), aber falls das aus irgendeinem Grund (Word-Version/Konfiguration)
-    nicht sauber funktioniert, haette ein bedingungsloses Quit() moeglicherweise
-    die ECHTE, sichtbare Word-Sitzung des Nutzers mitsamt anderer offener,
-    ungespeicherter Dokumente geschlossen. Jetzt zwei Absicherungen: (1) direkt
-    nach DispatchEx wird geprueft, ob die neue Instanz bereits Dokumente
-    enthaelt (waere ein Hinweis auf eine geteilte statt neue Instanz) - falls
-    ja, sofortiger, sauberer Abbruch (Rueckfall auf LibreOffice) OHNE
-    irgendetwas an dieser Instanz zu veraendern; (2) word.Quit() wird im
-    finally-Block nur noch aufgerufen, wenn in der Instanz nachweislich keine
-    Dokumente mehr offen sind. Aendert im Normalfall (DispatchEx verhaelt sich
-    korrekt) nichts am Verhalten.
+Version 3.4 / 2026-09-20 / Grund: COM-Thread-Initialisierung (CoInitialize) für 
+    Firmenrechner (z.B. Office 365 + Cryptshare) hinzugefügt, um Abstürze beim 
+    Hintergrund-Aufruf von MS Word zu verhindern. Zudem saubere Deinitialisierung
+    im finally-Block zur Vermeidung von Speicherlecks.
 
 Vergleicht zwei Word-Dokumente (.docx) auf Basis von Kapitelnummern als
 Fixpunkten und erzeugt einen eigenstaendigen HTML-Report:
@@ -65,7 +52,7 @@ from docx.oxml.ns import qn
 from docx.shared import Pt, RGBColor, Twips
 from lxml import etree
 
-SCRIPT_VERSION = "3.3"
+SCRIPT_VERSION = "3.4"
 REVIEW_SCHEMA_VERSION = "1.0"
 
 REVIEW_STATUS_OPTIONS = [
@@ -80,64 +67,14 @@ REVIEW_STATUS_OPTIONS = [
 # Kapitel-Erkennung
 # ---------------------------------------------------------------------------
 
-# DOORS/Jazz-Word-Exporte kodieren die Kapitel-/Anforderungsnummer meist NICHT
-# im Heading-Text, sondern als "NUMMER<TAB>Text" direkt im Fliesstext, z.B.:
-#   "2.1.1\tein (Fiedel) gemaess Kapitel 3.1, ..."
-# Word-Heading-Formatvorlagen sind dabei oft gar nicht gesetzt oder tragen
-# selbst keine Nummer. Manche Exporte sind zusaetzlich stark fragmentiert:
-# eine Nummer wie "2.1.4" kann ueber mehrere Absaetze verteilt sein
-# ("2", "2", ".1.4", ...). Die Erkennung unten deckt beide Faelle ab:
-#  1) sauberer Fall: NUMMER<TAB>Text in einem Absatz
-#  2) fragmentierter Fall: einzelne Zahl-Fragmente werden in einer Warteschlange
-#     gesammelt und durch nachfolgende ".N"-Fortsetzungen oder durch normalen
-#     Text vervollstaendigt
-
 ANCHOR_TAB_RE = re.compile(r"^(\d+(?:\.\d+)*[a-zA-Z]?)\s*\t\s*(.*)$")
 BARE_NUMBER_RE = re.compile(r"^(\d+[a-zA-Z]?)$")
 DOT_CONTINUATION_RE = re.compile(r"^\.(\d+(?:\.\d+)*[a-zA-Z]?)\s*\t?\s*(.*)$")
-
-# Bildformate, die ein Browser direkt per <img>/data-URI darstellen kann.
-# Word bettet eingefuegte Grafiken (v.a. per Copy&Paste aus anderen Office-Apps)
-# haeufig als EMF/WMF (Vektor-Metafile) ein - das kann kein Browser rendern.
-# Solche Bilder werden trotzdem auf Aenderungen geprueft (Hash-Vergleich),
-# im Report aber nur als Hinweis statt als Vorschau angezeigt.
 WEB_SAFE_IMAGE_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/gif", "image/bmp", "image/webp"}
-
-# ---------------------------------------------------------------------------
-# Automatische Kapitel-Nummerierung ueber Word-Listen
-# ---------------------------------------------------------------------------
-#
-# Viele Word-Vorlagen nummerieren Kapitelueberschriften NICHT als Text,
-# sondern ueber eine automatische Liste. Die Zahl ("2", "2.1", ...) existiert
-# dann NUR als Rendering-Ergebnis und steht nirgends im gespeicherten
-# Absatztext - sie muss durch Nachbilden der Word-Zaehllogik rekonstruiert
-# werden (pro Ebene hochzaehlen, tiefere Ebenen zuruecksetzen, wenn eine
-# flachere Ebene erneut auftritt). Word kennt dafuer DREI unterschiedliche
-# Verknuepfungswege, die alle in freier Wildbahn vorkommen und deshalb alle
-# unterstuetzt werden:
-#   1) Direkt am Absatz: <w:pPr><w:numPr><w:numId val="X"/></w:numPr></w:pPr>
-#      - der haeufigste Fall bei "normal" numerierten Ueberschriften.
-#   2) An der Formatvorlage selbst: <w:style><w:pPr><w:numPr>...
-#      in styles.xml - die Formatvorlage traegt ihre Numerierung direkt mit.
-#   3) "Mit Formatvorlage verknuepft" in numbering.xml:
-#      <w:abstractNum><w:lvl><w:pStyle val="Heading1"/>...> - die Numerierung
-#      ist in der Listendefinition selbst an eine Formatvorlage gebunden
-#      (kein numPr am Absatz oder an der Formatvorlage noetig).
-# Reihenfolge bei der Aufloesung entspricht Words eigener Prioritaet: zuerst
-# der Absatz selbst, dann die Formatvorlage, zuletzt die Verknuepfung in
-# numbering.xml.
-
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 
 
 def _load_numbering_definitions(docx_path):
-    """Liest word/numbering.xml und liefert (num_to_abstract, abstract_levels,
-    style_linked): num_to_abstract = {numId: abstractNumId}; abstract_levels =
-    {abstractNumId: {ilvl: {"start": int}}} (nur numFmt='decimal' - andere
-    Formate wie roemisch/alphabetisch werden ausgelassen); style_linked =
-    {style_id: {"ilvl": int, "start": int}} fuer Weg 3 (pStyle direkt in
-    <w:lvl>). Liefert (({}, {}, {})) wenn keine numbering.xml vorhanden oder
-    nicht lesbar ist."""
     try:
         with zipfile.ZipFile(docx_path) as z:
             if "word/numbering.xml" not in z.namelist():
@@ -152,7 +89,6 @@ def _load_numbering_definitions(docx_path):
         return {}, {}, {}
 
     ns = {"w": W_NS}
-
     abstract_levels = {}
     style_linked = {}
     for abstract_el in root.findall("w:abstractNum", ns):
@@ -187,9 +123,6 @@ def _load_numbering_definitions(docx_path):
 
 
 def _load_style_numpr(docx_path):
-    """Liest word/styles.xml und liefert {style_id: (numId, ilvl)} fuer
-    Formatvorlagen, die ihre eigene Numerierung direkt mitbringen (Weg 2:
-    <w:style><w:pPr><w:numPr>...). Liefert {} wenn nicht vorhanden/lesbar."""
     try:
         with zipfile.ZipFile(docx_path) as z:
             if "word/styles.xml" not in z.namelist():
@@ -219,8 +152,6 @@ def _load_style_numpr(docx_path):
 
 
 def _paragraph_numpr(paragraph):
-    """Liefert (numId, ilvl) aus dem DIREKT am Absatz gesetzten <w:numPr>
-    (Weg 1), oder None wenn der Absatz keine eigene Numerierung traegt."""
     try:
         num_pr = paragraph._p.find(f"{{{W_NS}}}pPr/{{{W_NS}}}numPr")
     except Exception:
@@ -237,18 +168,12 @@ def _paragraph_numpr(paragraph):
 
 
 class _HeadingNumberer:
-    """Bildet Words Zaehllogik fuer automatisch numerierte Ueberschriften
-    nach: pro Ebene hochzaehlen, tiefere Ebenen zuruecksetzen sobald eine
-    flachere Ebene erneut auftritt. Deckt alle drei Verknuepfungswege ab
-    (Absatz direkt, Formatvorlage, "mit Formatvorlage verknuepft" in
-    numbering.xml) - Prioritaet in dieser Reihenfolge, wie bei Word selbst."""
-
     def __init__(self, num_to_abstract, abstract_levels, style_numpr, style_linked):
         self.num_to_abstract = num_to_abstract
         self.abstract_levels = abstract_levels
         self.style_numpr = style_numpr
         self.style_linked = style_linked
-        self.counters = {}  # (abstractNumId) -> {ilvl: aktueller Zaehlerstand}
+        self.counters = {}
 
     def _level_info(self, num_id, ilvl):
         abstract_id = self.num_to_abstract.get(num_id)
@@ -260,7 +185,6 @@ class _HeadingNumberer:
     def number_for_paragraph(self, paragraph):
         style_id = _style_id(paragraph)
 
-        # Weg 1: Numerierung direkt am Absatz
         direct = _paragraph_numpr(paragraph)
         if direct is not None:
             num_id, ilvl = direct
@@ -268,20 +192,15 @@ class _HeadingNumberer:
             if info is not None:
                 return self._advance(abstract_id, ilvl, info["start"])
 
-        # Weg 2: Numerierung an der Formatvorlage selbst
         if style_id and style_id in self.style_numpr:
             num_id, ilvl = self.style_numpr[style_id]
             abstract_id, info = self._level_info(num_id, ilvl)
             if info is not None:
                 return self._advance(abstract_id, ilvl, info["start"])
 
-        # Weg 3: "Mit Formatvorlage verknuepft" in numbering.xml
         if style_id and style_id in self.style_linked:
             entry = self.style_linked[style_id]
-            # Eigener, von den anderen beiden Wegen getrennter Zaehler-Namensraum,
-            # da hier keine echte abstractNumId als Schluessel vorliegt.
-            return self._advance(f"_stylelinked_{style_id}", entry["ilvl"], entry["start"],
-                                  use_style_key=True)
+            return self._advance(f"_stylelinked_{style_id}", entry["ilvl"], entry["start"], use_style_key=True)
 
         return None
 
@@ -305,9 +224,6 @@ def _style_id(paragraph):
 
 
 def _extract_images(paragraph):
-    """Liefert eingebettete Bilder eines Absatzes als Liste von
-    {hash, blob, content_type}. Erkennt sowohl moderne DrawingML-Bilder
-    (<w:drawing>//<a:blip>) als auch aeltere VML-Bilder (<w:pict>//<v:imagedata>)."""
     images = []
     part = paragraph.part
     p_xml = paragraph._p
@@ -325,9 +241,6 @@ def _extract_images(paragraph):
             continue
         images.append({"hash": hashlib.sha1(blob).hexdigest(), "blob": blob, "content_type": content_type})
 
-    # Aeltere VML-Bilder (v:imagedata) - kommt in aelteren/kompatiblen Exporten vor.
-    # Der VML-Namespace ist in python-docx' Standard-nsmap nicht enthalten,
-    # daher hier direkt als Clark-Notation-URI.
     VML_NS = "urn:schemas-microsoft-com:vml"
     imagedatas = p_xml.findall(f".//{{{VML_NS}}}imagedata")
     for imgdata in imagedatas:
@@ -348,13 +261,6 @@ def _extract_images(paragraph):
 
 
 def extract_chapters(docx_path):
-    """Liest ein docx und liefert eine Liste von Kapiteln/Anforderungen in
-    Dokumentreihenfolge: {number, title, paragraphs: [...], text: str, images: [...]}.
-
-    Kapitel ohne erkennbare Nummer bekommen einen Fallback-Key ("_1", "_2", ...);
-    diese werden spaeter ueber Text-Aehnlichkeit nachtraeglich gematcht (siehe
-    build_comparison), da echte Nummern zwischen Exportversionen fehlen koennen.
-    """
     doc = Document(docx_path)
     num_to_abstract, abstract_levels, style_linked = _load_numbering_definitions(docx_path)
     style_numpr = _load_style_numpr(docx_path)
@@ -362,7 +268,7 @@ def extract_chapters(docx_path):
 
     chapters = []
     current = None
-    pending_numbers = []  # FIFO-Warteschlange fuer fragmentierte Zahl-Reste
+    pending_numbers = []
     fallback_counter = 0
     current_para_idx = -1
 
@@ -371,11 +277,6 @@ def extract_chapters(docx_path):
         if number is None:
             fallback_counter += 1
             number = f"_{fallback_counter}"
-        # first_para_index merkt sich, an welchem Word-Absatz (0-basiert)
-        # dieses Kapitel beginnt - wird fuer die exakte Seiten-Abfrage per
-        # MS-Word-COM-Automation gebraucht (siehe attach_pages).
-        # "source" ist NUR Diagnose-Metadatum (welches Muster hat das Kapitel
-        # erzeugt) - enthaelt nie Inhalt, siehe generate_diagnostic_report().
         current = {"number": number, "title": "", "paragraphs": [], "images": [],
                    "first_para_index": current_para_idx, "_source": source}
         chapters.append(current)
@@ -400,20 +301,6 @@ def extract_chapters(docx_path):
         text = para.text.strip()
         imgs = _extract_images(para)
 
-        # WICHTIG: Bilder werden ERST NACH der Kapitel-Klassifizierung
-        # angehaengt (ganz am Ende dieser Iteration), nicht vorher. Ein
-        # Absatz kann gleichzeitig eine neue Kapitel-Ueberschrift UND ein
-        # Bild enthalten (z.B. eine formatvorlagen-numerierte Ueberschrift
-        # mit eingebettetem Logo/Bild) - wuerde das Bild VOR der Erkennung
-        # des neuen Kapitels angehaengt, landet es faelschlich in einem
-        # gerade erst erzeugten Fallback-Kapitel (das dann als "_N" ans Ende
-        # sortiert wird) statt im tatsaechlichen, gerade begonnenen Kapitel.
-
-        # Automatische Kapitel-Nummerierung hat Vorrang: wenn dieser Absatz
-        # (direkt, ueber seine Formatvorlage, oder ueber eine "mit
-        # Formatvorlage verknuepfte" Listendefinition) Teil einer numerierten
-        # Kette ist, steht die Zahl im Text selbst NICHT und muss hier
-        # rekonstruiert werden.
         auto_number = numberer.number_for_paragraph(para)
         if auto_number is not None:
             pending_numbers.clear()
@@ -421,7 +308,7 @@ def extract_chapters(docx_path):
             if text:
                 append_text(text)
         elif not text:
-            pass  # nur Bild, kein Text -> haengt sich unten ans aktuelle Kapitel
+            pass
         else:
             m_tab = ANCHOR_TAB_RE.match(text)
             m_dot = DOT_CONTINUATION_RE.match(text)
@@ -439,7 +326,7 @@ def extract_chapters(docx_path):
                 pending_numbers.append(m_bare.group(1))
             elif pending_numbers:
                 number = pending_numbers.pop(0)
-                pending_numbers.clear()  # uebrige Duplikate/Reste verwerfen
+                pending_numbers.clear()
                 new_chapter(number, source="bare_fallback")
                 append_text(text)
             else:
@@ -456,7 +343,6 @@ def extract_chapters(docx_path):
 
 
 def index_by_key(chapters):
-    """Baut ein Dict number->chapter, dedupliziert Mehrfachnummern robust."""
     idx = {}
     counts = {}
     for ch in chapters:
@@ -469,23 +355,9 @@ def index_by_key(chapters):
 
 
 # ---------------------------------------------------------------------------
-# Seiten-Erkennung ("Buchform") - OPTIONAL, benoetigt LibreOffice
+# Seiten-Erkennung ("Buchform") - OPTIONAL
 # ---------------------------------------------------------------------------
-#
-# Word speichert die tatsaechliche Seitenzahl eines Absatzes NICHT in der
-# Datei - sie ergibt sich erst beim Layout/Rendern (abhaengig von Schriftart,
-# Raendern, Zoom etc.) und ist damit aus der reinen XML-Struktur nicht
-# ableitbar. Als Naeherung wird das Dokument per LibreOffice (soffice
-# --headless) zu PDF gerendert und jedes Kapitel per Textabgleich der
-# tatsaechlich gerenderten PDF-Seite zugeordnet. Das ist eine Annaeherung:
-# Word kann geringfuegig anders umbrechen als LibreOffice (andere
-# Schriftmetriken), i.d.R. stimmen die Seitenzahlen aber gut genug ueberein,
-# um Kapitel visuell nach "Seite" zu gruppieren.
 
-# Windows-Installationen koennen auf beliebigen Laufwerken liegen (nicht nur
-# C:) - z.B. "D:\Program Files\LibreOffice\program\soffice.exe". Kandidaten
-# und Glob-Muster werden daher ueber die gaengigen Laufwerksbuchstaben
-# generiert, statt nur C: fest anzunehmen.
 _WIN_DRIVES = ["C", "D", "E", "F"]
 
 SOFFICE_CANDIDATES = [
@@ -500,9 +372,6 @@ SOFFICE_CANDIDATES = [
     fr"{drive}:\Program Files (x86)\LibreOffice\program\soffice.exe" for drive in _WIN_DRIVES
 ]
 
-# Glob-Muster fuer versionierte/portable Installationen, z.B.
-# "D:\Program Files\LibreOffice 7.6\program\soffice.exe" oder Installationen
-# unter %LOCALAPPDATA%\Programs.
 SOFFICE_GLOB_PATTERNS = [
     fr"{drive}:\Program Files\LibreOffice*\program\soffice.exe" for drive in _WIN_DRIVES
 ] + [
@@ -511,13 +380,7 @@ SOFFICE_GLOB_PATTERNS = [
     str(Path.home() / "AppData/Local/Programs/LibreOffice*/program/soffice.exe"),
 ]
 
-
 def find_soffice(explicit_path=None):
-    """Sucht ein lauffaehiges LibreOffice/soffice-Binary. Gibt None zurueck,
-    wenn keins gefunden wird (Seiten-Gruppierung wird dann einfach ausgelassen).
-    Reihenfolge: expliziter Pfad > Umgebungsvariable SOFFICE_PATH >
-    PATH/Standardpfade > Glob-Suche nach versionierten/portablen
-    Windows-Installationen."""
     if explicit_path:
         return explicit_path if Path(explicit_path).exists() else None
     env_path = os.environ.get("SOFFICE_PATH")
@@ -532,17 +395,12 @@ def find_soffice(explicit_path=None):
             if found:
                 return found
     for pattern in SOFFICE_GLOB_PATTERNS:
-        matches = sorted(glob.glob(pattern), reverse=True)  # neueste Version zuerst
+        matches = sorted(glob.glob(pattern), reverse=True)
         if matches:
             return matches[0]
     return None
 
-
 def render_page_texts(docx_path, soffice_path, timeout=90):
-    """Rendert ein docx per LibreOffice zu PDF und liefert eine Liste mit dem
-    (whitespace-normalisierten) Text je Seite. Liefert None bei jedem Fehler
-    (kein soffice, Timeout, Konvertierungsfehler, PDF nicht lesbar) - der
-    Aufrufer behandelt das als "Seiten-Gruppierung nicht verfuegbar"."""
     try:
         import pdfplumber
     except ImportError:
@@ -561,22 +419,14 @@ def render_page_texts(docx_path, soffice_path, timeout=90):
     except Exception:
         return None
 
-
 def assign_pages_to_chapters(chapters, page_texts, key_len=40):
-    """Ordnet jedem Kapitel per Substring-Suche (auf normalisiertem Text) die
-    PDF-Seite zu, auf der sein Text-Anfang vorkommt. Sucht positions-bewusst
-    vorwaerts (Cursor innerhalb der aktuellen Seite + Seiten-Index), damit
-    WIEDERHOLTER/DUPLIZIERTER Text (z.B. zwei inhaltlich identische
-    Abschnitte) nicht faelschlich immer der ersten Fundstelle zugeordnet
-    wird - jede bereits gefundene Textstelle wird "verbraucht" und kann
-    nicht nochmal treffen. Setzt ch['page'] direkt auf jedem Kapitel-Dict."""
     if not page_texts:
         for ch in chapters:
             ch["page"] = None
         return
 
     page_idx = 0
-    cursor = 0  # Zeichen-Position innerhalb der aktuellen Seite, ab der weitergesucht wird
+    cursor = 0
     for ch in chapters:
         key = normalize_whitespace(ch["text"])[:key_len]
         if key:
@@ -589,15 +439,10 @@ def assign_pages_to_chapters(chapters, page_texts, key_len=40):
                     page_idx += 1
                     cursor = 0
                 else:
-                    break  # letzte Seite erreicht, nicht gefunden - Kapitel bleibt hier
+                    break
         ch["page"] = page_idx + 1
 
-
 def find_word_com():
-    """Prueft, ob MS Word per COM-Automation ansprechbar sein KOENNTE (nur
-    Windows, pywin32 installiert). Das ist nur ein Verfuegbarkeits-Check auf
-    das Python-Paket - ob tatsaechlich Word installiert ist, zeigt sich erst
-    beim eigentlichen Verbindungsversuch in assign_pages_via_word_com."""
     if sys.platform != "win32":
         return False
     try:
@@ -606,40 +451,13 @@ def find_word_com():
     except ImportError:
         return False
 
-
 def assign_pages_via_word_com(chapters, docx_path, timeout=120):
-    """Fragt MS Word SELBST (COM-Automation, nur Windows, benoetigt
-    'pip install pywin32' und eine lokale Word-Installation) fuer jedes
-    Kapitel die tatsaechlich von Word berechnete Seitenzahl ab - keine
-    Annaeherung wie beim LibreOffice/PDF-Weg, sondern das Original.
-
-    Setzt ch['page'] direkt auf jedem Kapitel-Dict. Gibt True bei Erfolg
-    zurueck, False wenn Word/pywin32 nicht verfuegbar ist oder irgendein
-    Fehler auftrat (dann bleibt ch['page'] unveraendert, damit der Aufrufer
-    z.B. noch auf LibreOffice ausweichen kann).
-
-    WICHTIG (Bugfix): Fragt NICHT mehr ueber first_para_index (Absatz-Index)
-    nach, sondern sucht den Kapiteltext direkt per Word.Range.Find - genau
-    wie beim LibreOffice-Weg. Grund: first_para_index wird beim Einlesen ueber
-    python-docx's document.paragraphs gezaehlt, das TABELLEN-INHALT KOMPLETT
-    UEBERSPRINGT (Absaetze innerhalb von Tabellenzellen zaehlen dort nicht
-    mit). Word selbst (COM Document.Paragraphs) zaehlt Tabellenabsaetze aber
-    mit. Jede Tabelle vor einem Kapitel (Deckblatt, Revisionshistorie, etc.)
-    hat dadurch bisher den Index verschoben und zu einer FALSCHEN (zu
-    fruehen) Seitenzahl gefuehrt - bei grossen Dokumenten mit mehreren
-    Tabellen potenziell erheblich (real beobachtet: Seite 30 angezeigt als
-    Seite 17). Die textbasierte Suche ist von Tabellen/Absatz-Zaehlung
-    unabhaengig.
-
-    HINWEIS: Dieser Pfad ist speziell fuer Rechner ohne LibreOffice, aber mit
-    installiertem MS Office (z.B. Firmenrechner) gedacht. Nutzt die COM-
-    Konstante wdActiveEndPageNumber (=3) von Range.Information(...).
-    """
     if sys.platform != "win32":
         return False
     try:
         import pywintypes
         import win32com.client
+        import pythoncom
     except ImportError:
         return False
 
@@ -649,16 +467,9 @@ def assign_pages_via_word_com(chapters, docx_path, timeout=120):
     word = None
     doc = None
     try:
+        pythoncom.CoInitialize()
         word = win32com.client.DispatchEx("Word.Application")
-        # Sicherheitscheck: DispatchEx soll eine NEUE, eigenstaendige
-        # Word-Instanz erzeugen (unabhaengig von einer evtl. bereits
-        # laufenden, sichtbaren Word-Sitzung des Nutzers mit anderen offenen
-        # Dokumenten). Sind hier trotzdem schon Dokumente vorhanden, deutet
-        # das darauf hin, dass wir uns technisch an eine bestehende Instanz
-        # "angehaengt" haben statt eine eigene zu bekommen - in dem Fall
-        # brechen wir lieber sofort und sauber ab (kein Oeffnen weiterer
-        # Dokumente in einer fremden Instanz, kein spaeteres Quit()-Risiko),
-        # statt moeglicherweise die Arbeit des Nutzers zu stoeren.
+        
         if word.Documents.Count > 0:
             return False
         word.Visible = False
@@ -667,14 +478,8 @@ def assign_pages_via_word_com(chapters, docx_path, timeout=120):
             str(Path(docx_path).resolve()), ReadOnly=True, AddToRecentFiles=False, Visible=False,
             ConfirmConversions=False,
         )
-        # WICHTIG: Bei unsichtbar (Visible=False) geoeffneten Dokumenten
-        # berechnet Word die Seitenumbrueche teils nicht zuverlaessig neu,
-        # bevor Range.Information(wdActiveEndPageNumber) abgefragt wird - ein
-        # bekanntes Verhalten bei COM-Automation im Hintergrund. Erzwingt hier
-        # explizit eine vollstaendige Neuberechnung der Paginierung, bevor
-        # ueberhaupt eine Seitenzahl abgefragt wird.
         try:
-            doc.ActiveWindow.View.Type = 3  # wdPrintView - Seitenlayout-Ansicht
+            doc.ActiveWindow.View.Type = 3
         except Exception:
             pass
         try:
@@ -682,13 +487,13 @@ def assign_pages_via_word_com(chapters, docx_path, timeout=120):
         except Exception:
             pass
         try:
-            doc.ComputeStatistics(2)  # wdStatisticPages - erzwingt zusaetzlich volle Seitenberechnung
+            doc.ComputeStatistics(2)
         except Exception:
             pass
 
         WD_ACTIVE_END_PAGE_NUMBER = 3
-        WD_FIND_STOP = 0  # nicht am Dokumentende zum Anfang zurueckspringen
-        FIND_KEY_LEN = 80  # Word's Find hat praktische Laengenbeschraenkungen - grosszuegig, aber sicher
+        WD_FIND_STOP = 0
+        FIND_KEY_LEN = 80
         doc_end = doc.Content.End
         cursor_start = 0
         found_count = 0
@@ -700,13 +505,6 @@ def assign_pages_via_word_com(chapters, docx_path, timeout=120):
                 continue
             try:
                 rng = doc.Range(cursor_start, doc_end)
-                # Eigenschaften einzeln setzen statt viele Positionsargumente an
-                # Execute() zu uebergeben - bei "spaeter Bindung" (DispatchEx,
-                # kein generiertes Wrapper-Modul) ist das deutlich zuverlaessiger,
-                # eine falsch interpretierte Positions-/Typ-Zuordnung kann sonst
-                # STILL fehlschlagen (Execute() liefert dann ueberall False,
-                # ohne Python-Exception - genau das fuehrte zuvor dazu, dass
-                # trotz gemeldetem "Erfolg" gar keine Seitenzahlen ankamen).
                 f = rng.Find
                 f.ClearFormatting()
                 f.Text = key
@@ -725,12 +523,6 @@ def assign_pages_via_word_com(chapters, docx_path, timeout=120):
             except Exception:
                 ch["page"] = None
 
-        # WICHTIG: Nur als Erfolg melden, wenn tatsaechlich mindestens eine
-        # Seitenzahl ermittelt wurde. Vorher wurde hier bedingungslos True
-        # zurueckgegeben, selbst wenn JEDE Find()-Abfrage fehlschlug - der
-        # Aufrufer hielt den Word-COM-Weg dann faelschlich fuer erfolgreich
-        # und wich NICHT auf LibreOffice aus, wodurch am Ende gar keine
-        # Seitenzahlen im Bericht auftauchten (statt falscher/genauer welche).
         return found_count > 0
     except Exception:
         return False
@@ -742,37 +534,17 @@ def assign_pages_via_word_com(chapters, docx_path, timeout=120):
             pass
         try:
             if word is not None:
-                # WICHTIG (Sicherheitsfix): word.Quit() nur aufrufen, wenn in
-                # dieser Instanz nachweislich KEINE anderen Dokumente mehr
-                # offen sind. DispatchEx soll zwar immer eine eigene, neue
-                # Word-Instanz erzeugen (getrennt von einer bereits laufenden,
-                # sichtbaren Word-Sitzung mit anderen offenen Dokumenten) -
-                # sollte das aus irgendeinem Grund (Word-Version, Konfiguration)
-                # doch nicht sauber getrennt sein, wuerde ein bedingungsloses
-                # Quit() sonst moeglicherweise die ECHTE Word-Sitzung des
-                # Nutzers mitsamt anderer offener, ungespeicherter Dokumente
-                # schliessen. Das darf unter keinen Umstaenden passieren -
-                # im Zweifel bleibt die (dann vermutlich fremde) Instanz
-                # einfach offen, statt ein Risiko einzugehen.
                 if word.Documents.Count == 0:
                     word.Quit()
+        except Exception:
+            pass
+        try:
+            pythoncom.CoUninitialize()
         except Exception:
             pass
 
 
 def attach_pages(chapters_a, chapters_b, path_a, path_b, soffice_path=None, word_timeout_s=45):
-    """Versucht, beiden Kapitel-Listen echte Seitenzahlen zuzuordnen.
-    Reihenfolge: (1) MS Word per COM (exakt, nur Windows mit installiertem
-    Word), (2) LibreOffice-Rendering + Textabgleich (Naeherung, aber
-    plattformunabhaengig), (3) keine Seiteninfo. Gibt einen Status-String
-    zurueck: 'word_com', 'libreoffice' oder None (nicht verfuegbar).
-
-    WICHTIG: Der Word-COM-Weg wird ueber _run_with_timeout() mit einem
-    harten Zeitlimit (word_timeout_s) abgesichert - COM-Automation kann bei
-    unerwarteten Umstaenden (z.B. ein unsichtbarer System-/Trust-Dialog)
-    unbegrenzt haengen bleiben, ohne dass Python das von innen erkennen
-    wuerde. Bei Ueberschreitung wird sauber auf LibreOffice ausgewichen,
-    statt den ganzen Vergleich zum Stillstand zu bringen."""
     if find_word_com():
         status_a, ok_a, _, _ = _run_with_timeout(assign_pages_via_word_com, word_timeout_s, chapters_a, path_a)
         ok_a = bool(ok_a) if status_a == "ok" else False
@@ -782,7 +554,6 @@ def attach_pages(chapters_a, chapters_b, path_a, path_b, soffice_path=None, word
             ok_b = bool(ok_b) if status_b == "ok" else False
         if ok_a and ok_b:
             return "word_com"
-        # Bei Teilerfolg/Timeout lieber sauber zuruecksetzen und den anderen Weg probieren
         for ch in chapters_a:
             ch.pop("page", None)
         for ch in chapters_b:
@@ -803,21 +574,16 @@ def attach_pages(chapters_a, chapters_b, path_a, path_b, soffice_path=None, word
         ch["page"] = None
     return None
 
-
 # ---------------------------------------------------------------------------
 # Diff-Logik
 # ---------------------------------------------------------------------------
 
 _TOKEN_RE = re.compile(r"\s+|\S+")
 
-
 def _tokenize(text):
     return _TOKEN_RE.findall(text)
 
-
 def render_diff_pair(text_a, text_b):
-    """Liefert (html_a, html_b) mit <span class="del"> / <span class="ins">
-    Markierungen fuer die jeweils andere Seite (Wort-Diff)."""
     tokens_a = _tokenize(text_a)
     tokens_b = _tokenize(text_b)
     sm = difflib.SequenceMatcher(None, tokens_a, tokens_b, autojunk=False)
@@ -842,30 +608,20 @@ def render_diff_pair(text_a, text_b):
         "".join(right_parts).replace("\n", "<br>"),
     )
 
-
 def plain_html(text):
     return html.escape(text).replace("\n", "<br>")
-
 
 def image_hash_set(chapter):
     return sorted(img["hash"] for img in chapter.get("images", []))
 
-
 def classify(ch_a, ch_b):
-    """Liefert (status, ratio, images_changed). images_changed ist True, wenn
-    sich die Menge der eingebetteten Grafiken zwischen beiden Seiten
-    unterscheidet (Hash-Vergleich, ordnungsunabhaengig)."""
     images_changed = image_hash_set(ch_a) != image_hash_set(ch_b)
     if ch_a["text"] == ch_b["text"] and ch_a["title"] == ch_b["title"] and not images_changed:
         return "unchanged", 1.0, False
     ratio = difflib.SequenceMatcher(None, ch_a["text"], ch_b["text"], autojunk=False).ratio()
     return "changed", ratio, images_changed
 
-
 def natural_sort_key(number, order_index):
-    """Numerische Kapitelnummern (1, 1.2, 2.10 ...) korrekt sortieren;
-    nicht-numerische Fallback-Keys (_preamble, _3 ...) ans Ende, stabil
-    nach urspruenglicher Dokumentreihenfolge."""
     if number.startswith("_"):
         return (1, order_index, ())
     parts = number.split(".")
@@ -875,31 +631,12 @@ def natural_sort_key(number, order_index):
         return (1, order_index, ())
     return (0, 0, parsed)
 
-
 def _similarity(a, b):
     if not a or not b:
         return 0.0
     return difflib.SequenceMatcher(None, a, b, autojunk=False).ratio()
 
-
 def fallback_match_unnumbered(deleted_only, new_only, threshold=0.6, time_budget_s=5.0):
-    """Versucht, Kapitel ohne (uebereinstimmende) Nummer per Text-/Titel-
-    Aehnlichkeit einander zuzuordnen. Das faengt Faelle ab, in denen eine
-    Kapitelnummer in einer der beiden Exportversionen komplett fehlt (echter
-    Fallback-Key "_..."), der Kapiteltext/-titel aber erkennbar aehnlich ist.
-
-    WICHTIG: Kandidaten mit einer (ggf. falsch rekonstruierten, aber nicht
-    leeren) Nummer wie "2" oder "2.1.2a" werden hier NICHT beruecksichtigt -
-    nur echte Fallback-Keys ("_1", "_2", ...). Sonst werden bei stark
-    fragmentierten Dokumenten faelschlich inhaltlich unpassende Kapitel
-    zusammengeklebt, nur weil beide Seiten "uebrig" waren.
-
-    Wie detect_possible_moves() ist der Kern O(n*m) - bei sehr vielen
-    unnumerierten Kapiteln (untypisch, aber moeglich bei stark fragmentierten
-    Exporten) mit denselben zwei Absicherungen versehen: billiger Laengen-
-    Vorfilter + SequenceMatcher.quick_ratio() vor dem teuren ratio(), und ein
-    hartes Zeitbudget (bricht sauber ab statt zu haengen - liefert dann ein
-    Teilergebnis statt eines vollstaendigen)."""
     candidates_a = [c for c in deleted_only if c["number"].startswith("_")]
     candidates_b = [c for c in new_only if c["number"].startswith("_")]
 
@@ -929,16 +666,10 @@ def fallback_match_unnumbered(deleted_only, new_only, threshold=0.6, time_budget
             pairs.append((ca, best, best_score))
     return pairs
 
-
 def normalize_whitespace(text):
     return re.sub(r"\s+", " ", text).strip()
 
-
 def _normalize_chapters_for_comparison(chapters):
-    """Erstellt Kopien der Kapitel mit auf Einzelzeilen normalisiertem
-    Text/Titel (Zeilenumbrueche/Mehrfach-Leerzeichen -> ein Leerzeichen),
-    fuer den optionalen 'Zeilenumbrueche ignorieren'-Modus. Bilder bleiben
-    unangetastet (Referenz wird uebernommen)."""
     out = []
     for ch in chapters:
         new_ch = dict(ch)
@@ -947,13 +678,7 @@ def _normalize_chapters_for_comparison(chapters):
         out.append(new_ch)
     return out
 
-
 def build_comparison(chapters_a, chapters_b, ignore_linebreaks=True):
-    """ignore_linebreaks (Standard: True): Zeilen-/Absatzumbrueche werden vor
-    dem Vergleich zu einzelnen Leerzeichen normalisiert, sodass reines
-    Neu-Umbrechen von Text (z.B. durch Nachbearbeitung oder unterschiedliche
-    Absatzstruktur) nicht als inhaltliche Aenderung gewertet wird. Mit
-    ignore_linebreaks=False wird strikt inklusive Absatzgrenzen verglichen."""
     if ignore_linebreaks:
         chapters_a = _normalize_chapters_for_comparison(chapters_a)
         chapters_b = _normalize_chapters_for_comparison(chapters_b)
@@ -991,8 +716,6 @@ def build_comparison(chapters_a, chapters_b, ignore_linebreaks=True):
         else:
             new_only.append(cb)
 
-    # Zweiter Durchgang: verbleibende unmatched Kapitel per Text-/Titel-
-    # Aehnlichkeit zusammenfuehren (faengt fehlende/verschobene Nummern ab).
     fallback_pairs = fallback_match_unnumbered(deleted_only, new_only)
     matched_a_keys = {ca["key"] for ca, _, _ in fallback_pairs}
     matched_b_keys = {cb["key"] for _, cb, _ in fallback_pairs}
@@ -1051,30 +774,10 @@ def build_comparison(chapters_a, chapters_b, ignore_linebreaks=True):
     return rows
 
 
-# ---------------------------------------------------------------------------
-# Verschiebungs-Erkennung ("moved content")
-# ---------------------------------------------------------------------------
-#
-# Das normale Matching (build_comparison) laeuft strikt ueber die
-# Kapitelnummer. Wandert ein Thema von Kapitel 3.2 (Dokument A) nach Kapitel
-# 5.1 (Dokument B) - und existieren BEIDE Nummern real in beiden Dokumenten -
-# werden das zwei unabhaengige "geaendert"/"neu"-Zeilen, ohne dass ein
-# Zusammenhang erkannt wird (der Fallback-Textvergleich in
-# fallback_match_unnumbered greift nur, wenn eine Seite GAR KEINE echte
-# Nummer hat). Diese Funktion laeuft NACH dem normalen Matching als separate,
-# rein informative Zusatz-Erkennung: sie fasst NICHTS zusammen und aendert
-# keinen Status, sondern haengt Kapiteln, deren verschwundener/neuer
-# Text-Anteil einem anderen Kapitel stark aehnelt, einen Hinweis an.
-
 MOVE_MIN_LEN = 30
 MOVE_THRESHOLD = 0.55
 
-
 def _diff_removed_added(text_a, text_b):
-    """Liefert (entfernter_text, hinzugefuegter_text) als Klartext - die
-    Teile, die beim Wort-Diff als 'delete'/'replace' bzw. 'insert'/'replace'
-    markiert wuerden, hier aber nur als reiner Text fuer den Aehnlichkeits-
-    Abgleich der Verschiebungs-Erkennung."""
     tokens_a = _tokenize(text_a)
     tokens_b = _tokenize(text_b)
     sm = difflib.SequenceMatcher(None, tokens_a, tokens_b, autojunk=False)
@@ -1086,30 +789,7 @@ def _diff_removed_added(text_a, text_b):
             added.append("".join(tokens_b[j1:j2]))
     return normalize_whitespace("".join(removed)), normalize_whitespace("".join(added))
 
-
 def detect_possible_moves(rows, min_len=MOVE_MIN_LEN, threshold=MOVE_THRESHOLD, time_budget_s=8.0):
-    """Sucht nach Kapiteln, deren verschwundener Text-Anteil (aus 'geaendert'
-    oder 'geloescht') einem hinzugekommenen Text-Anteil (aus 'geaendert' oder
-    'neu') eines ANDEREN Kapitels stark aehnelt - ein Indiz dafuer, dass
-    Inhalt zwischen real unterschiedlich nummerierten Kapiteln verschoben
-    wurde. Haengt bei Fund row['moves'] (Liste von Hinweisen) an die
-    betroffenen Zeilen an. Rein informativ - aendert nie den Status oder das
-    Matching selbst.
-
-    Der Kern ist O(n*m) in der Anzahl geaenderter/neuer/geloeschter Kapitel -
-    bei sehr vielen Aenderungen auf grossen Dokumenten kann das ohne
-    Schutzmassnahmen sehr lange dauern (fuehlt sich dann wie ein Haenger an,
-    ist aber "nur" sehr langsam). Deshalb zwei Sicherungen: (1) ein billiger
-    Laengen-Vorfilter + SequenceMatcher.quick_ratio() (viel billiger als das
-    eigentliche ratio()) schliesst die meisten Kandidatenpaare aus, bevor der
-    teure Vergleich ueberhaupt laeuft; (2) ein hartes Zeitbudget
-    (time_budget_s) bricht sauber ab statt zu haengen, falls trotzdem zu
-    viele Kandidaten uebrig bleiben (z.B. bei kurzem, sich stark
-    aehnelndem Text).
-
-    Gibt (moves, complete) zurueck - complete=False bedeutet: Zeitbudget
-    ausgeschoepft, Ergebnis ist ein Teilergebnis (was bis dahin gefunden
-    wurde), nicht vollstaendig."""
     row_by_key = {r["key"]: r for r in rows}
     removed_pool, added_pool = [], []
 
@@ -1144,10 +824,6 @@ def detect_possible_moves(rows, min_len=MOVE_MIN_LEN, threshold=MOVE_THRESHOLD, 
         for akey, anum, atext, alen in added_pool_len:
             if akey == rkey:
                 continue
-            # Billiger Vorfilter: die maximal erreichbare ratio() ist durch
-            # die Laengen bereits nach oben begrenzt (2*min(len)/(lenA+lenB)) -
-            # liegt das schon unter der Schwelle, lohnt sich der teure
-            # Vergleich gar nicht erst.
             total_len = rlen + alen
             if total_len == 0 or (2 * min(rlen, alen) / total_len) < threshold:
                 continue
@@ -1171,7 +847,6 @@ def detect_possible_moves(rows, min_len=MOVE_MIN_LEN, threshold=MOVE_THRESHOLD, 
             )
     return moves, complete
 
-
 def compute_stats(chapters_a, chapters_b, rows):
     return {
         "total_a": len(chapters_a),
@@ -1182,35 +857,17 @@ def compute_stats(chapters_a, chapters_b, rows):
         "deleted": sum(1 for r in rows if r["status"] == "deleted"),
     }
 
-
 # ---------------------------------------------------------------------------
 # HTML-Report
 # ---------------------------------------------------------------------------
 
 STATUS_LABEL = {
-    "unchanged": "Unverändert",
-    "changed": "Geändert",
-    "new": "Neu",
-    "deleted": "Gelöscht",
+    "unchanged": "Unverändert", "changed": "Geändert", "new": "Neu", "deleted": "Gelöscht",
 }
-
 STATUS_ICON = {
-    "unchanged": "\u2713",  # check
-    "changed": "\u270E",    # pencil
-    "new": "\u271A",        # plus
-    "deleted": "\u2716",    # cross
+    "unchanged": "\u2713", "changed": "\u270E", "new": "\u271A", "deleted": "\u2716",
 }
-
-STATUS_LABEL_SHORT = {
-    "unchanged": "Unverändert",
-    "changed": "Geändert",
-    "new": "Neu",
-    "deleted": "Gelöscht",
-}
-
-# Farben je Status - abgestimmt auf die Farben im HTML-Report (siehe CSS
-# --c-unchanged/--c-changed/--c-new/--c-deleted), damit HTML und DOCX
-# optisch konsistent wirken.
+STATUS_LABEL_SHORT = STATUS_LABEL
 STATUS_COLORS_DOCX = {
     "unchanged": {"rgb": "16A34A", "fill": "DCFCE7"},
     "changed": {"rgb": "C2410C", "fill": "FFEDD5"},
@@ -1218,10 +875,7 @@ STATUS_COLORS_DOCX = {
     "deleted": {"rgb": "B91C1C", "fill": "FEE2E2"},
 }
 
-
 def _plain_preview(html_text, max_len=220):
-    """Wandelt den HTML-Diff-Text eines Kapitels in reinen Klartext fuer den
-    DOCX-Report um (Tags entfernen, kuerzen)."""
     if not html_text:
         return ""
     plain = re.sub(r"<[^>]+>", "", html_text)
@@ -1231,10 +885,7 @@ def _plain_preview(html_text, max_len=220):
         plain = plain[:max_len].rsplit(" ", 1)[0] + " …"
     return plain
 
-
 def _set_cell_shading(cell, fill_hex):
-    """python-docx hat keine eingebaute API fuer Zellenschattierung - wird
-    daher direkt als <w:shd>-Element in die Zellen-XML eingehaengt."""
     tcPr = cell._tc.get_or_add_tcPr()
     shd = OxmlElement("w:shd")
     shd.set(qn("w:val"), "clear")
@@ -1242,11 +893,7 @@ def _set_cell_shading(cell, fill_hex):
     shd.set(qn("w:fill"), fill_hex)
     tcPr.append(shd)
 
-
 def _set_col_widths(table, widths_dxa):
-    """Setzt Spaltenbreiten sowohl auf der Tabelle als auch auf jeder Zelle -
-    beides ist noetig, sonst werden die Breiten in manchen Word-Versionen
-    (und Google Docs) ignoriert."""
     table.autofit = False
     for row in table.rows:
         for cell, width in zip(row.cells, widths_dxa):
@@ -1254,20 +901,8 @@ def _set_col_widths(table, widths_dxa):
     for col, width in zip(table.columns, widths_dxa):
         col.width = Twips(width)
 
-
 def generate_docx_report(rows, stats, name_a, name_b, output_path, meta_a=None, meta_b=None, reviews=None):
-    """Erzeugt einen kompakten Word-Report fuer die schnelle Orientierung
-    (z.B. Weitergabe im Unternehmen an Leute ohne Zugriff auf den
-    HTML-Report): Zusammenfassung oben, danach eine Tabelle mit allen
-    Kapiteln, die sich geaendert haben/neu/geloescht sind (mit kurzem
-    Text-Auszug beider Seiten), am Ende eine kompakte Gesamtliste aller
-    Kapitel zur Nachvollziehbarkeit.
-
-    reviews: optionales Dict {key: {"status":..., "comment":...}} aus einer
-    zuvor exportierten Review-JSON-Datei - wird dann als zusaetzliche Spalte
-    mit aufgenommen."""
     doc = Document()
-
     doc.add_heading("Kapitelvergleich", level=0)
     meta_a = meta_a or {"name": name_a, "modified": ""}
     meta_b = meta_b or {"name": name_b, "modified": ""}
@@ -1284,13 +919,11 @@ def generate_docx_report(rows, stats, name_a, name_b, output_path, meta_a=None, 
         f"docx_chapter_compare.py Version {SCRIPT_VERSION}"
     ).runs[0].font.size = Pt(9)
 
-    # --- Zusammenfassung -----------------------------------------------
     doc.add_heading("Zusammenfassung", level=1)
     summary = doc.add_table(rows=2, cols=6)
     summary.style = "Light Grid Accent 1"
     labels = ["Kapitel A", "Kapitel B", "Unverändert", "Geändert", "Neu", "Gelöscht"]
-    values = [stats["total_a"], stats["total_b"], stats["unchanged"],
-              stats["changed"], stats["new"], stats["deleted"]]
+    values = [stats["total_a"], stats["total_b"], stats["unchanged"], stats["changed"], stats["new"], stats["deleted"]]
     for col, label in enumerate(labels):
         summary.cell(0, col).text = label
         summary.cell(0, col).paragraphs[0].runs[0].bold = True
@@ -1308,7 +941,6 @@ def generate_docx_report(rows, stats, name_a, name_b, output_path, meta_a=None, 
 
     changed_rows = [r for r in rows if r["status"] != "unchanged"]
 
-    # --- Aenderungen im Detail ------------------------------------------
     doc.add_heading(f"Änderungen im Detail ({len(changed_rows)})", level=1)
     if not changed_rows:
         doc.add_paragraph("Keine Änderungen gefunden - beide Dokumente sind inhaltlich identisch.")
@@ -1359,7 +991,6 @@ def generate_docx_report(rows, stats, name_a, name_b, output_path, meta_a=None, 
                         if run.font.size is None:
                             run.font.size = Pt(9)
 
-    # --- Vollstaendige Kapitelliste (kompakt, zur Nachvollziehbarkeit) --
     doc.add_heading(f"Vollständige Kapitelliste ({len(rows)})", level=1)
     overview = doc.add_table(rows=1, cols=3)
     overview.style = "Light List Accent 1"
@@ -1384,14 +1015,10 @@ def generate_docx_report(rows, stats, name_a, name_b, output_path, meta_a=None, 
 
     doc.save(output_path)
 
-
 def _safe_id(key):
-    """Wandelt einen Kapitel-Key in eine gueltige HTML-id/Fragment-Zeichenkette um."""
     return re.sub(r"[^a-zA-Z0-9_-]", "_", key)
 
-
 def doc_metadata(path):
-    """Name + letzter-Aenderungszeitpunkt einer Datei, fuers Review-JSON."""
     path = Path(path)
     try:
         modified = datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds")
@@ -1399,27 +1026,18 @@ def doc_metadata(path):
         modified = ""
     return {"name": path.name, "modified": modified}
 
-
 def _preview_title(title, body_html, max_len=70):
-    """Wenn kein separater Titel vorhanden ist (typisch bei DOORS-Requirement-
-    Zeilen ohne Ueberschrift), aus dem Fliesstext eine kurze Vorschau ableiten."""
     if title:
         return title
     if not body_html:
         return ""
     plain = re.sub(r"<[^>]+>", "", body_html).replace("&amp;", "&")
-    plain = html.unescape(plain)
-    plain = plain.strip()
+    plain = html.unescape(plain).strip()
     if len(plain) > max_len:
         plain = plain[:max_len].rsplit(" ", 1)[0] + " …"
     return plain
 
-
 def _images_html(images):
-    """Rendert eine Thumbnail-Galerie fuer eine Liste von Bildern. Web-taugliche
-    Formate (PNG/JPEG/GIF/BMP/WebP) werden als data-URI eingebettet; andere
-    (v.a. EMF/WMF-Vektorgrafiken, die Browser nicht darstellen koennen)
-    bekommen stattdessen einen Hinweistext."""
     if not images:
         return ""
     parts = ['<div class="img-gallery">']
@@ -1431,20 +1049,11 @@ def _images_html(images):
         else:
             size_kb = max(1, len(img["blob"]) // 1024)
             label = ct or "unbekanntes Format"
-            parts.append(
-                f'<div class="img-placeholder" title="Keine Browser-Vorschau moeglich">'
-                f'🖼 {html.escape(label)} ({size_kb} KB)</div>'
-            )
+            parts.append(f'<div class="img-placeholder" title="Keine Browser-Vorschau moeglich">🖼 {html.escape(label)} ({size_kb} KB)</div>')
     parts.append("</div>")
     return "".join(parts)
 
-
 def _page_classes(page, first, last):
-    """CSS-Klassen fuer die Seiten-Box: durchgaengiger Rahmen ueber mehrere
-    Zeilen hinweg, wenn sie zur selben (gerenderten) Seite gehoeren. first/last
-    bestimmen, an welcher Kante die Box eine sichtbare obere/untere Umrandung
-    + Eckenrundung bekommt (mittendrin bleibt die Kante offen, damit die Box
-    ueber mehrere Zeilen hinweg nahtlos wirkt)."""
     if page is None:
         return ""
     band = "pageband-even" if page % 2 == 0 else "pageband-odd"
@@ -1458,9 +1067,7 @@ def _page_classes(page, first, last):
         grp = "pg-mid"
     return f" {band} pg-grouped {grp}"
 
-
 def _moves_html(moves_list):
-    """Rendert die Verschiebungs-Hinweise eines Kapitels (falls vorhanden)."""
     if not moves_list:
         return ""
     parts = []
@@ -1468,15 +1075,10 @@ def _moves_html(moves_list):
         pct = int(m["score"] * 100)
         arrow = "→" if m["direction"] == "to" else "←"
         verb = "evtl. verschoben nach" if m["direction"] == "to" else "evtl. hierher verschoben von"
-        parts.append(
-            f'<div class="move-note">🔀 {verb} Kapitel {html.escape(m["other_number"])} '
-            f'({pct}% ähnlich) {arrow}</div>'
-        )
+        parts.append(f'<div class="move-note">🔀 {verb} Kapitel {html.escape(m["other_number"])} ({pct}% ähnlich) {arrow}</div>')
     return "".join(parts)
 
-
-def _cell(number, title, body_html, images, side, status, page=None, first_in_group=False, last_in_group=False,
-          moves=None):
+def _cell(number, title, body_html, images, side, status, page=None, first_in_group=False, last_in_group=False, moves=None):
     page_class = _page_classes(page, first_in_group, last_in_group)
     page_tag = f'<div class="page-tag">📄 Seite {page}</div>' if (page is not None and first_in_group) else ""
 
@@ -1497,31 +1099,17 @@ def _cell(number, title, body_html, images, side, status, page=None, first_in_gr
             f"{_moves_html(moves)}"
             f"</details>"
         )
-    # WICHTIG: pro Grid-Spalte muss genau EIN direktes Kind-Element ans
-    # .grid-row (display:grid) uebergeben werden - die Seiten-Marke wird
-    # daher zusammen mit der Zelle in einen gemeinsamen Slot-Wrapper gepackt,
-    # statt als zusaetzliches Geschwister-Element, sonst verschiebt sich die
-    # 3-Spalten-Zuordnung (links/Connector/rechts) bei jeder Seiten-Marke.
     return f'<div class="cell-slot">{page_tag}{inner}</div>'
 
-
 def _compute_group_flags(page_seq):
-    """Liefert (first_flags, last_flags) - je True, wenn die Zeile an dieser
-    Stelle die erste/letzte einer zusammenhaengenden Seiten-Gruppe ist.
-    Seiten=None (keine Seiteninfo bzw. "kein Kapitel X in diesem Dokument")
-    werden fuer die Gruppierung uebersprungen/ignoriert, statt eine neue
-    Gruppe zu erzwingen - sonst reisst eine Luecke (Kapitel nur auf einer
-    Seite vorhanden) die Box unnoetig auseinander."""
     n = len(page_seq)
     first_flags, last_flags = [False] * n, [False] * n
-
     next_real = [None] * n
     upcoming = None
     for i in range(n - 1, -1, -1):
         next_real[i] = upcoming
         if page_seq[i] is not None:
             upcoming = page_seq[i]
-
     last_real = None
     for i, p in enumerate(page_seq):
         if p is None:
@@ -1531,16 +1119,11 @@ def _compute_group_flags(page_seq):
         last_real = p
     return first_flags, last_flags
 
-
 def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None, meta_b=None,
                  pages_method=None, diagnostics=None, moves=None, moves_complete=True):
     meta_a = meta_a or {"name": name_a, "modified": ""}
     meta_b = meta_b or {"name": name_b, "modified": ""}
-
-    review_options_html = "".join(
-        f'<option value="{v}">{html.escape(label)}</option>' for v, label in REVIEW_STATUS_OPTIONS
-    )
-
+    review_options_html = "".join(f'<option value="{v}">{html.escape(label)}</option>' for v, label in REVIEW_STATUS_OPTIONS)
     pages_a_seq = [r.get("page_a") for r in rows]
     pages_b_seq = [r.get("page_b") for r in rows]
     first_a, last_a = _compute_group_flags(pages_a_seq)
@@ -1586,9 +1169,6 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
           </div>
           <div class="link-diff" id="ld-{safe_id}"></div>
         </div>"""
-        # Abstand zur vorherigen Zeile nur einfuegen, wenn mindestens eine
-        # Seite hier tatsaechlich eine neue Seiten-Gruppe beginnt - so
-        # verschmelzen die Boxen ueber mehrere Zeilen optisch nahtlos.
         continues_group = idx > 0 and not first_a[idx] and not first_b[idx]
         wrapper_class = "row-wrapper continues-group" if continues_group else "row-wrapper"
         row_html.append(
@@ -1607,26 +1187,16 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
       <div class="stat stat-new"><div class="stat-num">{stats['new']}</div><div class="stat-label">Neu</div></div>
       <div class="stat stat-deleted"><div class="stat-num">{stats['deleted']}</div><div class="stat-label">Gelöscht</div></div>
     """
-
-    linebreak_note = (
-        "Zeilenumbrüche werden beim Vergleich ignoriert (nur Wortinhalt zählt)."
-        if ignore_linebreaks else
-        "Zeilenumbrüche werden strikt mitverglichen (inkl. Absatzgrenzen)."
-    )
+    linebreak_note = "Zeilenumbrüche werden beim Vergleich ignoriert (nur Wortinhalt zählt)." if ignore_linebreaks else "Zeilenumbrüche werden strikt mitverglichen (inkl. Absatzgrenzen)."
     if pages_method == "word_com":
         page_note = "📄 Kapitel sind nach der von MS Word berechneten Seite gruppiert (exakt, per COM-Automation)."
     elif pages_method == "libreoffice":
-        page_note = "📄 Kapitel sind nach gerenderter Seite gruppiert (via LibreOffice, Näherung – Word kann geringfügig anders umbrechen)."
+        page_note = "📄 Kapitel sind nach gerenderter Seite gruppiert (via LibreOffice, Näherung)."
     elif pages_method == "unavailable":
-        page_note = "📄 Seiten-Gruppierung nicht verfügbar (weder MS Word/COM noch LibreOffice/soffice gefunden, oder Rendern fehlgeschlagen)."
+        page_note = "📄 Seiten-Gruppierung nicht verfügbar (weder MS Word/COM noch LibreOffice gefunden, oder fehlerhaft)."
     else:
         page_note = ""
 
-    # Preflight-Diagnose-Box: immer im Report gespeichert (nicht nur bei
-    # Fehlern), damit man nicht extra --diagnose-pages auf der Kommandozeile
-    # laufen lassen muss, um zu sehen, woran eine nicht verfuegbare
-    # Seiten-Gruppierung liegt. Standardmaessig eingeklappt, wenn alles
-    # funktioniert hat, automatisch aufgeklappt, wenn etwas fehlgeschlagen ist.
     diagnostics_html = ""
     if diagnostics:
         diag_items = "".join(f"<li>{html.escape(line)}</li>" for line in diagnostics)
@@ -1645,38 +1215,26 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
             for m in moves
         )
         incomplete_note = (
-            "<p style=\"color:#b45309;\">⚠ Zeitbudget ausgeschöpft - diese Liste ist "
-            "unvollständig, es wurden nicht alle Kapitel-Paare geprüft.</p>"
+            "<p style=\"color:#b45309;\">⚠ Zeitbudget ausgeschöpft - Liste unvollständig.</p>"
             if not moves_complete else ""
         )
         moves_summary_html = f"""
   <details class="moves-summary" open>
     <summary>🔀 Mögliche Verschiebungen erkannt ({len(moves)})</summary>
-    <p>Inhalt, der auf einer Seite verschwunden ist, ähnelt stark neuem/geändertem Inhalt in einem
-       anderen Kapitel - ein Indiz für Umsortierung. Rein informativ, ändert nichts am Matching oben.</p>
-    {incomplete_note}
-    <ul>{move_items}</ul>
+    {incomplete_note}<ul>{move_items}</ul>
   </details>"""
     elif moves is not None and not moves_complete:
         moves_summary_html = """
   <details class="moves-summary" open>
     <summary>🔀 Verschiebungs-Erkennung unvollständig</summary>
-    <p style="color:#b45309;">⚠ Zeitbudget ausgeschöpft, bevor alle Kapitel-Paare geprüft werden
-       konnten (sehr viele Änderungen). Kein Ergebnis in der verfügbaren Zeit gefunden - das
-       heißt nicht zwingend, dass es keine Verschiebungen gibt.</p>
+    <p style="color:#b45309;">⚠ Zeitbudget ausgeschöpft, bevor alle Paare geprüft wurden.</p>
   </details>"""
 
-    # Sicher als JS-Objekt-Literale einbetten (json.dumps escaped Anfuehrungszeichen,
-    # Backslashes etc. korrekt - kein manuelles String-Basteln noetig).
     doc_meta_json = json.dumps({"a": meta_a, "b": meta_b}, ensure_ascii=False)
     script_version_json = json.dumps(SCRIPT_VERSION)
     review_schema_json = json.dumps(REVIEW_SCHEMA_VERSION)
     chapter_keys_json = json.dumps({r["key"]: r["number"] for r in rows}, ensure_ascii=False)
     safe_id_to_key_json = json.dumps({_safe_id(r["key"]): r["key"] for r in rows}, ensure_ascii=False)
-    # Rohe (nicht bereits diff-gerenderte) Texte je Kapitel - werden fuer den
-    # client-seitigen Wort-Diff bei MANUELLEN Verknuepfungen gebraucht: dort
-    # werden zwei beliebige (nicht vom normalen Matching gepaarte) Kapitel
-    # verglichen, das kann nur im Browser zur Laufzeit passieren.
     row_texts_json = json.dumps(
         {r["key"]: {"a": r.get("text_a_raw") or "", "b": r.get("text_b_raw") or ""} for r in rows},
         ensure_ascii=False,
@@ -1689,31 +1247,17 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
 <title>Dokumentvergleich: {html.escape(name_a)} vs {html.escape(name_b)}</title>
 <style>
   :root {{
-    --c-unchanged: #16a34a;
-    --c-changed: #ea580c;
-    --c-new: #2563eb;
-    --c-deleted: #dc2626;
-    --bg: #f7f7f8;
-    --border: #e2e2e6;
+    --c-unchanged: #16a34a; --c-changed: #ea580c; --c-new: #2563eb; --c-deleted: #dc2626;
+    --bg: #f7f7f8; --border: #e2e2e6;
   }}
   * {{ box-sizing: border-box; }}
-  body {{
-    font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif;
-    margin: 0; background: var(--bg); color: #1a1a1a;
-  }}
-  header {{
-    position: sticky; top: 0; z-index: 10;
-    background: #fff; border-bottom: 1px solid var(--border);
-    padding: 14px 20px;
-  }}
+  body {{ font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 0; background: var(--bg); color: #1a1a1a; }}
+  header {{ position: sticky; top: 0; z-index: 10; background: #fff; border-bottom: 1px solid var(--border); padding: 14px 20px; }}
   h1 {{ font-size: 16px; margin: 0 0 10px 0; font-weight: 600; }}
   .doc-names {{ font-size: 13px; color: #555; margin-bottom: 10px; }}
   .doc-names b {{ color: #111; }}
   .stats-bar {{ display: flex; gap: 10px; flex-wrap: wrap; align-items: stretch; }}
-  .stat {{
-    background: #fafafa; border: 1px solid var(--border); border-radius: 8px;
-    padding: 6px 14px; min-width: 74px; text-align: center;
-  }}
+  .stat {{ background: #fafafa; border: 1px solid var(--border); border-radius: 8px; padding: 6px 14px; min-width: 74px; text-align: center; }}
   .stat-num {{ font-size: 20px; font-weight: 700; }}
   .stat-label {{ font-size: 11px; color: #666; margin-top: 2px; }}
   .stat-unchanged .stat-num {{ color: var(--c-unchanged); }}
@@ -1728,40 +1272,19 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
   .li-changed {{ background: var(--c-changed); }}
   .li-new {{ background: var(--c-new); }}
   .li-deleted {{ background: var(--c-deleted); }}
-
   .compare-grid {{ padding: 16px 20px 60px; }}
   .row-wrapper {{ margin-bottom: 14px; }}
   .row-wrapper.continues-group {{ margin-bottom: 0; }}
   .row-wrapper.hidden-by-filter {{ display: none; }}
-  @keyframes deltaFlash {{
-    0%   {{ box-shadow: 0 0 0 4px rgba(234, 88, 12, 0.65); }}
-    100% {{ box-shadow: 0 0 0 4px rgba(234, 88, 12, 0); }}
-  }}
+  @keyframes deltaFlash {{ 0% {{ box-shadow: 0 0 0 4px rgba(234, 88, 12, 0.65); }} 100% {{ box-shadow: 0 0 0 4px rgba(234, 88, 12, 0); }} }}
   .delta-flash {{ animation: deltaFlash 1.1s ease-out; border-radius: 8px; }}
-  .grid-row {{
-    display: grid;
-    grid-template-columns: 1fr 70px 1fr;
-    gap: 0;
-    align-items: stretch;
-  }}
-  .cell {{
-    background: #fff; border: 1px solid var(--border); border-radius: 6px;
-    padding: 8px 12px; font-size: 13px; line-height: 1.5; overflow-wrap: break-word;
-  }}
+  .grid-row {{ display: grid; grid-template-columns: 1fr 70px 1fr; gap: 0; align-items: stretch; }}
+  .cell {{ background: #fff; border: 1px solid var(--border); border-radius: 6px; padding: 8px 12px; font-size: 13px; line-height: 1.5; overflow-wrap: break-word; }}
   .cell-slot {{ min-width: 0; }}
   .cell-left {{ border-right: none; border-radius: 6px 0 0 6px; }}
   .cell-right {{ border-left: none; border-radius: 0 6px 6px 0; }}
   .cell-empty {{ display: flex; align-items: center; justify-content: center; color: #999; font-size: 12px; font-style: italic; background: #fbfbfb; }}
-  .page-tag {{
-    font-size: 18px; color: #1e293b; font-weight: 800; letter-spacing: 0.04em;
-    margin: 16px 0 6px 6px; text-transform: uppercase;
-  }}
-
-  /* Seiten-Bandierung (abwechselnder Hintergrund je Seite) bleibt hier -
-     der eigentliche Rahmen (pg-*) steht WEITER UNTEN, NACH den status-
-     spezifischen border-color-Regeln (.row-unchanged/.row-changed/...),
-     damit er nicht von der (viel helleren) Statusfarbe ueberschrieben wird
-     (gleiche CSS-Spezifitaet, es gewinnt die spaeter stehende Regel). */
+  .page-tag {{ font-size: 18px; color: #1e293b; font-weight: 800; letter-spacing: 0.04em; margin: 16px 0 6px 6px; text-transform: uppercase; }}
   .pageband-odd {{ background: #f4f6fa; }}
   summary {{ cursor: pointer; font-weight: 600; }}
   .chnum {{ color: #555; font-variant-numeric: tabular-nums; }}
@@ -1769,31 +1292,13 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
   .chbody {{ margin-top: 6px; color: #333; white-space: normal; }}
   .del {{ background: #fee2e2; color: #991b1b; text-decoration: line-through; }}
   .ins {{ background: #dcfce7; color: #14532d; }}
-
-  .connector {{
-    display: flex; flex-direction: column; align-items: center; justify-content: center;
-    position: relative;
-  }}
-  .connector::before {{
-    content: ""; position: absolute; left: 0; right: 0; top: 50%; height: 3px;
-    transform: translateY(-50%);
-  }}
+  .connector {{ display: flex; flex-direction: column; align-items: center; justify-content: center; position: relative; }}
+  .connector::before {{ content: ""; position: absolute; left: 0; right: 0; top: 50%; height: 3px; transform: translateY(-50%); }}
   .conn-unchanged::before {{ background: var(--c-unchanged); }}
   .conn-changed::before {{ background: var(--c-changed); }}
   .conn-new::before {{ background: linear-gradient(to right, transparent 50%, var(--c-new) 50%); }}
   .conn-deleted::before {{ background: linear-gradient(to right, var(--c-deleted) 50%, transparent 50%); }}
-  /* Seiten-Spange: durchgehende vertikale Linie in der Connector-Spalte,
-     solange fuer diese Zeile auf mindestens einer Seite eine Seitenzahl
-     bekannt ist - macht sichtbar, dass die linke und rechte Seiten-Box
-     zusammengehoeren (ein Paar bilden), statt zwei unabhaengige Kaesten zu
-     wirken. Ragt bewusst leicht ueber die Zeilenhoehe hinaus (top/bottom
-     negativ), damit sie ueber den Zeilen-Abstand hinweg optisch nahtlos
-     mit der Spange der Nachbarzeile verschmilzt.
-  */
-  .connector.has-page-spine::after {{
-    content: ""; position: absolute; left: 50%; top: -8px; bottom: -8px;
-    width: 3px; background: #1e3a8a; opacity: 0.4; transform: translateX(-50%); z-index: 0;
-  }}
+  .connector.has-page-spine::after {{ content: ""; position: absolute; left: 50%; top: -8px; bottom: -8px; width: 3px; background: #1e3a8a; opacity: 0.4; transform: translateX(-50%); z-index: 0; }}
   .conn-icon {{ z-index: 1; background: #fff; border-radius: 50%; width: 22px; height: 22px; display: flex; align-items: center; justify-content: center; font-size: 12px; border: 2px solid; }}
   .conn-unchanged .conn-icon {{ border-color: var(--c-unchanged); color: var(--c-unchanged); }}
   .conn-changed .conn-icon {{ border-color: var(--c-changed); color: var(--c-changed); }}
@@ -1801,59 +1306,25 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
   .conn-deleted .conn-icon {{ border-color: var(--c-deleted); color: var(--c-deleted); }}
   .conn-pct {{ font-size: 10px; color: #666; margin-top: 2px; z-index: 1; }}
   .conn-img-badge {{ font-size: 12px; z-index: 1; margin-top: 2px; }}
-
   .img-gallery {{ display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }}
   .img-thumb {{ max-width: 160px; max-height: 120px; border: 1px solid var(--border); border-radius: 4px; object-fit: contain; background: #fff; }}
-  .img-placeholder {{
-    font-size: 11px; color: #92400e; background: #fffbeb; border: 1px dashed #fcd34d;
-    border-radius: 4px; padding: 6px 10px; max-width: 220px;
-  }}
-  .move-note {{
-    font-size: 11px; color: #6d28d9; background: #f5f3ff; border: 1px solid #ddd6fe;
-    border-radius: 4px; padding: 5px 9px; margin-top: 8px;
-  }}
-  .moves-summary {{
-    margin-top: 8px; font-size: 12px; background: #f5f3ff; border: 1px solid #ddd6fe;
-    border-radius: 6px; padding: 6px 12px; color: #4c1d95;
-  }}
+  .img-placeholder {{ font-size: 11px; color: #92400e; background: #fffbeb; border: 1px dashed #fcd34d; border-radius: 4px; padding: 6px 10px; max-width: 220px; }}
+  .move-note {{ font-size: 11px; color: #6d28d9; background: #f5f3ff; border: 1px solid #ddd6fe; border-radius: 4px; padding: 5px 9px; margin-top: 8px; }}
+  .moves-summary {{ margin-top: 8px; font-size: 12px; background: #f5f3ff; border: 1px solid #ddd6fe; border-radius: 6px; padding: 6px 12px; color: #4c1d95; }}
   .moves-summary summary {{ cursor: pointer; color: #6d28d9; font-weight: 600; }}
   .moves-summary ul {{ margin: 8px 0 4px 0; padding-left: 20px; }}
   .moves-summary li {{ margin-bottom: 4px; }}
-
   .row-unchanged .cell-left, .row-unchanged .cell-right {{ border-color: #bbf7d0; }}
   .row-changed .cell-left, .row-changed .cell-right {{ border-color: #fed7aa; }}
   .row-new .cell-right {{ border-color: #bfdbfe; }}
   .row-deleted .cell-left {{ border-color: #fecaca; }}
-
-  /* Seiten-Box: kraeftiger, unuebersehbarer Rahmen ueber mehrere Zeilen
-     hinweg, wenn sie zur selben (gerenderten) Seite gehoeren. Steht
-     BEWUSST nach den Status-Farbregeln oben, damit er nicht von der
-     (viel helleren) Statusfarbe ueberschrieben wird (gleiche
-     CSS-Spezifitaet - hier gewinnt die zuletzt stehende Regel).
-     pg-first/last oeffnen die Box oben/unten mit Eckenrundung, pg-mid
-     laesst die Kante nahtlos offen, pg-both rundet eine alleinstehende
-     Ein-Zeilen-Seite komplett. */
-  .cell.pg-grouped {{
-    border-left-width: 6px !important; border-left-color: #1e3a8a !important;
-    background: #eef2ff;
-  }}
+  .cell.pg-grouped {{ border-left-width: 6px !important; border-left-color: #1e3a8a !important; background: #eef2ff; }}
   .cell-left.pg-grouped {{ margin-left: 6px; }}
   .cell-right.pg-grouped {{ margin-right: 6px; }}
-  .cell.pg-mid {{
-    border-top: none !important; border-bottom: none !important; border-radius: 0 !important;
-  }}
-  .cell.pg-first {{
-    border-top: 5px solid #1e3a8a !important; border-bottom: none !important;
-    box-shadow: 0 -3px 8px -2px rgba(30, 58, 138, 0.35);
-  }}
-  .cell.pg-last {{
-    border-bottom: 5px solid #1e3a8a !important; border-top: none !important;
-    box-shadow: 0 3px 8px -2px rgba(30, 58, 138, 0.35);
-  }}
-  .cell.pg-both {{
-    border-top: 5px solid #1e3a8a !important; border-bottom: 5px solid #1e3a8a !important;
-    box-shadow: 0 0 8px -1px rgba(30, 58, 138, 0.35);
-  }}
+  .cell.pg-mid {{ border-top: none !important; border-bottom: none !important; border-radius: 0 !important; }}
+  .cell.pg-first {{ border-top: 5px solid #1e3a8a !important; border-bottom: none !important; box-shadow: 0 -3px 8px -2px rgba(30, 58, 138, 0.35); }}
+  .cell.pg-last {{ border-bottom: 5px solid #1e3a8a !important; border-top: none !important; box-shadow: 0 3px 8px -2px rgba(30, 58, 138, 0.35); }}
+  .cell.pg-both {{ border-top: 5px solid #1e3a8a !important; border-bottom: 5px solid #1e3a8a !important; box-shadow: 0 0 8px -1px rgba(30, 58, 138, 0.35); }}
   .cell-left.pg-first, .cell-left.pg-both {{ border-top-left-radius: 10px; }}
   .cell-left.pg-last, .cell-left.pg-mid {{ border-top-left-radius: 0; }}
   .cell-left.pg-last, .cell-left.pg-both {{ border-bottom-left-radius: 10px; }}
@@ -1862,18 +1333,9 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
   .cell-right.pg-last, .cell-right.pg-mid {{ border-top-right-radius: 0; }}
   .cell-right.pg-last, .cell-right.pg-both {{ border-bottom-right-radius: 10px; }}
   .cell-right.pg-first, .cell-right.pg-mid {{ border-bottom-right-radius: 0; }}
-
-  button.filter-btn {{
-    border: 1px solid var(--border); background: #fff; border-radius: 6px;
-    padding: 5px 12px; font-size: 12px; cursor: pointer;
-  }}
+  button.filter-btn {{ border: 1px solid var(--border); background: #fff; border-radius: 6px; padding: 5px 12px; font-size: 12px; cursor: pointer; }}
   button.filter-btn.active {{ background: #111; color: #fff; border-color: #111; }}
-
-  .review-box {{
-    display: flex; align-items: center; gap: 8px;
-    background: #fafafa; border: 1px solid var(--border); border-top: none;
-    border-radius: 0 0 6px 6px; padding: 6px 12px; font-size: 12px;
-  }}
+  .review-box {{ display: flex; align-items: center; gap: 8px; background: #fafafa; border: 1px solid var(--border); border-top: none; border-radius: 0 0 6px 6px; padding: 6px 12px; font-size: 12px; }}
   .review-box label {{ color: #666; white-space: nowrap; }}
   .review-select {{ font-size: 12px; padding: 3px 4px; border-radius: 4px; border: 1px solid var(--border); background: #fff; }}
   .review-comment {{ flex: 1; font-size: 12px; padding: 4px 8px; border-radius: 4px; border: 1px solid var(--border); }}
@@ -1881,39 +1343,24 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
   .review-box.rv-not_accepted {{ background: #fef2f2; }}
   .review-box.rv-refinement_customer {{ background: #eff6ff; }}
   .review-box.rv-internal_clarification {{ background: #fff7ed; }}
-  .manual-link-box {{
-    background: #fafafa; border: 1px solid var(--border); border-top: none;
-    border-radius: 0 0 6px 6px; padding: 6px 12px; font-size: 12px;
-  }}
+  .manual-link-box {{ background: #fafafa; border: 1px solid var(--border); border-top: none; border-radius: 0 0 6px 6px; padding: 6px 12px; font-size: 12px; }}
   .ml-row {{ display: flex; align-items: center; gap: 8px; }}
   .manual-link-box label {{ color: #666; white-space: nowrap; }}
   .manual-link-input {{ flex: 1; font-size: 12px; padding: 4px 8px; border-radius: 4px; border: 1px solid var(--border); }}
   .manual-link-box.ml-valid {{ background: #eff6ff; }}
   .manual-link-box.ml-valid .manual-link-input {{ border-color: #2563eb; color: #1d4ed8; }}
   .manual-link-box.ml-invalid .manual-link-input {{ border-color: #dc2626; color: #b91c1c; }}
-  .link-diff {{
-    margin-top: 8px; padding: 8px 10px; background: #fff; border: 1px solid #bfdbfe;
-    border-radius: 4px; font-size: 12px; line-height: 1.5; display: none;
-  }}
+  .link-diff {{ margin-top: 8px; padding: 8px 10px; background: #fff; border: 1px solid #bfdbfe; border-radius: 4px; font-size: 12px; line-height: 1.5; display: none; }}
   .link-diff.ld-visible {{ display: block; }}
   .link-diff .ld-label {{ font-size: 10px; text-transform: uppercase; letter-spacing: 0.03em; color: #2563eb; font-weight: 700; margin-bottom: 4px; }}
-  .ml-btn {{
-    border: 1px solid var(--border); background: #fff; border-radius: 4px;
-    padding: 3px 8px; font-size: 12px; cursor: pointer; color: #444;
-  }}
+  .ml-btn {{ border: 1px solid var(--border); background: #fff; border-radius: 4px; padding: 3px 8px; font-size: 12px; cursor: pointer; color: #444; }}
   .ml-btn:hover {{ background: #f1f5f9; }}
   .version-line {{ font-size: 11px; color: #888; }}
-  .diagnostics-box {{
-    margin-top: 8px; font-size: 12px; background: #f8fafc; border: 1px solid var(--border);
-    border-radius: 6px; padding: 6px 12px;
-  }}
+  .diagnostics-box {{ margin-top: 8px; font-size: 12px; background: #f8fafc; border: 1px solid var(--border); border-radius: 6px; padding: 6px 12px; }}
   .diagnostics-box summary {{ cursor: pointer; color: #475569; font-weight: 600; }}
   .diagnostics-box ul {{ margin: 8px 0 4px 0; padding-left: 20px; color: #334155; }}
   .diagnostics-box li {{ margin-bottom: 4px; }}
-  #review-import-warning {{
-    display: none; background: #fffbeb; border: 1px solid #fcd34d; color: #92400e;
-    padding: 8px 14px; border-radius: 6px; font-size: 12px; margin-top: 8px; white-space: pre-line;
-  }}
+  #review-import-warning {{ display: none; background: #fffbeb; border: 1px solid #fcd34d; color: #92400e; padding: 8px 14px; border-radius: 6px; font-size: 12px; margin-top: 8px; white-space: pre-line; }}
 </style>
 </head>
 <body>
@@ -1957,12 +1404,12 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
   const SCRIPT_VERSION = {script_version_json};
   const REVIEW_SCHEMA_VERSION = {review_schema_json};
   const REVIEW_STATUS_VALUES = ['accepted', 'not_accepted', 'refinement_customer', 'internal_clarification'];
-  const CHAPTER_KEYS = {chapter_keys_json};       // key -> Kapitelnummer (fuer Anzeige/Abgleich)
-  const SAFE_ID_TO_KEY = {safe_id_to_key_json};   // safe_id -> key
-  const ROW_TEXTS = {row_texts_json};             // key -> {{a, b}} Rohtext beider Seiten, fuer den Verknuepfungs-Diff
+  const CHAPTER_KEYS = {chapter_keys_json};
+  const SAFE_ID_TO_KEY = {safe_id_to_key_json};
+  const ROW_TEXTS = {row_texts_json};
   const KEY_TO_SAFE_ID = Object.fromEntries(Object.entries(SAFE_ID_TO_KEY).map(function(e) {{ return [e[1], e[0]]; }}));
-  const MANUAL_LINKS = {{}};  // safe_id -> Ziel-key (nur im Speicher, Persistenz ueber Review-JSON)
-  const LINK_DIFF_MAX_TOKENS = 10000;  // Sicherheitsgrenze - Myers-Diff bleibt bis hierhin schnell genug
+  const MANUAL_LINKS = {{}};
+  const LINK_DIFF_MAX_TOKENS = 10000;
 
   const REVIEW_BOXES = {{}};
   document.querySelectorAll('.review-box').forEach(function(box) {{
@@ -1975,7 +1422,7 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
 
   function setFilter(mode) {{
     filterMode = mode;
-    deltaIndex = -1;  // Filter geaendert - Delta-Navigation faengt neu an
+    deltaIndex = -1;
     ['all', 'diff', 'unreviewed'].forEach(function(m) {{
       document.getElementById('btn-' + m).classList.toggle('active', m === mode);
     }});
@@ -2012,7 +1459,7 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
     const row = rows[deltaIndex];
     row.scrollIntoView({{behavior: 'smooth', block: 'center'}});
     row.classList.remove('delta-flash');
-    void row.offsetWidth;  // Reflow erzwingen, damit die Animation bei erneutem Treffer neu startet
+    void row.offsetWidth;
     row.classList.add('delta-flash');
   }}
 
@@ -2034,15 +1481,6 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
     return d.innerHTML;
   }}
 
-  // Myers-Diff (O(N*D) statt O(n*m) wie bei einer klassischen LCS-Tabelle) -
-  // laeuft rein im Browser, wird gebraucht weil bei manuellen Verknuepfungen
-  // zwei Kapitel verglichen werden, die das normale (server-seitige)
-  // Matching nie gegenuebergestellt hat. Bei sehr aehnlichen Texten (der
-  // Normalfall) extrem schnell (D ist klein); selbst bei komplett
-  // unterschiedlichen Texten bis LINK_DIFF_MAX_TOKENS Woertern zusammen noch
-  // im Sekundenbereich (getestet: 5000+5000 komplett unterschiedliche
-  // Woerter < 1.3s). Nur jenseits dieser Grenze (sehr seltener Fall) wird
-  // auf unmarkierten Text ausgewichen, um den Browser nicht zu blockieren.
   function myersDiffOps(a, b) {{
     const n = a.length, m = b.length;
     if (n === 0 && m === 0) {{ return []; }}
@@ -2128,15 +1566,12 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
       diffBox.innerHTML = '';
       return;
     }}
-    // "Verschwundener" Text der Quelle (bevorzugt Seite A - Dokument alt)
-    // gegen "aufgetauchten" Text des Ziels (bevorzugt Seite B - Dokument neu) -
-    // das bildet die typische "wohin ist der Inhalt gewandert"-Frage ab.
     const ownText = ROW_TEXTS[ownKey].a || ROW_TEXTS[ownKey].b || '';
     const targetText = ROW_TEXTS[targetKey].b || ROW_TEXTS[targetKey].a || '';
     const [leftHtml, rightHtml, wasCompared] = wordDiffHtml(ownText, targetText);
     const targetNumber = CHAPTER_KEYS[targetKey] || targetKey;
     diffBox.innerHTML =
-      '<div class="ld-label">' + (wasCompared ? 'Unterschied' : 'Vergleich (Text zu lang fuer Markierung)') +
+      '<div class="ld-label">' + (wasCompared ? 'Unterschied' : 'Vergleich (Text zu lang)') +
       ' zu Kapitel ' + escHtml(targetNumber) + ':</div>' +
       '<div>' + leftHtml + '</div><div style="margin-top:4px;">' + rightHtml + '</div>';
     diffBox.classList.add('ld-visible');
@@ -2278,22 +1713,22 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
     const da = data.doc_a || {{}}, db = data.doc_b || {{}};
     let warnings = [];
     if (da.name && DOC_META.a.name && da.name !== DOC_META.a.name) {{
-      warnings.push('Dokument A: JSON nennt "' + da.name + '", aktueller Report vergleicht "' + DOC_META.a.name + '".');
+      warnings.push('Dokument A: JSON nennt "' + da.name + '", Report vergleicht "' + DOC_META.a.name + '".');
     }}
     if (da.modified && DOC_META.a.modified && da.modified !== DOC_META.a.modified) {{
       warnings.push('Dokument A wurde seit dem Review-Export geändert (Zeitstempel weicht ab).');
     }}
     if (db.name && DOC_META.b.name && db.name !== DOC_META.b.name) {{
-      warnings.push('Dokument B: JSON nennt "' + db.name + '", aktueller Report vergleicht "' + DOC_META.b.name + '".');
+      warnings.push('Dokument B: JSON nennt "' + db.name + '", Report vergleicht "' + DOC_META.b.name + '".');
     }}
     if (db.modified && DOC_META.b.modified && db.modified !== DOC_META.b.modified) {{
       warnings.push('Dokument B wurde seit dem Review-Export geändert (Zeitstempel weicht ab).');
     }}
     if (unmatched > 0) {{
-      warnings.push(unmatched + ' Kapitel aus der JSON-Datei wurden im aktuellen Report nicht gefunden (evtl. andere Kapitelstruktur) und übersprungen.');
+      warnings.push(unmatched + ' Kapitel aus der JSON-Datei wurden im aktuellen Report nicht gefunden und übersprungen.');
     }}
     if (linkUnmatched > 0) {{
-      warnings.push(linkUnmatched + ' manuelle Verknüpfung(en) konnten nicht wiederhergestellt werden (Kapitel nicht mehr vorhanden).');
+      warnings.push(linkUnmatched + ' manuelle Verknüpfung(en) konnten nicht wiederhergestellt werden.');
     }}
     if (warnings.length) {{
       warnBox.textContent = '⚠ ' + warnings.join('\\n⚠ ');
@@ -2301,34 +1736,14 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
     }} else {{
       warnBox.style.display = 'none';
     }}
-    alert('Review importiert: ' + matched + ' Kapitel übernommen, ' + linkMatched + ' manuelle Verknüpfung(en) wiederhergestellt.' + (warnings.length ? ' Siehe Hinweis oben.' : ''));
+    alert('Review importiert: ' + matched + ' Kapitel, ' + linkMatched + ' Verknüpfung(en).');
   }}
 </script>
 </body>
 </html>
 """
 
-
-# ---------------------------------------------------------------------------
-# Diagnose-Report ("stuck"/langsame Laeufe analysieren, OHNE Inhalt)
-# ---------------------------------------------------------------------------
-#
-# Fuer Faelle wie "bei 200 Seiten bleibt das Tool haengen": laeuft die
-# komplette Pipeline mit Zeitmessung pro Schritt UND Timeout pro Schritt
-# (per Hilfs-Thread - eine haengende Funktion blockiert den Hauptthread des
-# Diagnose-Laufs nicht, der Report wird trotzdem fertig, markiert den
-# betroffenen Schritt aber als 'timeout'). Der Report enthaelt AUSSCHLIESSLICH
-# Zahlen (Absatz-/Kapitelanzahlen, Textlaengen, Zeitdauern) und
-# Umgebungsinfo - NIE den eigentlichen Kapitel-/Anforderungstext. Damit kann
-# ein Performance-Problem analysiert werden, ohne dass Verschlusssachen-Inhalt
-# die eigene Maschine verlassen muss.
-
 def _run_with_timeout(func, timeout, *args, **kwargs):
-    """Fuehrt func in einem Hilfs-Thread aus und wartet hoechstens 'timeout'
-    Sekunden. Liefert (status, result, duration, error) - status ist 'ok',
-    'timeout' oder 'error'. Bei 'timeout' laeuft der Hilfs-Thread als Daemon
-    im Hintergrund weiter (wird beim Prozessende automatisch beendet), der
-    Diagnose-Lauf selbst blockiert dadurch aber nicht dauerhaft."""
     result_box = {}
 
     def runner():
@@ -2354,9 +1769,7 @@ def _run_with_timeout(func, timeout, *args, **kwargs):
         result_box.get("error"),
     )
 
-
 def _text_len_stats(chapters):
-    """Reine Laengen-Statistik ueber Kapiteltexte - NIE der Text selbst."""
     lengths = [len(ch.get("text", "")) for ch in chapters]
     if not lengths:
         return {"count": 0}
@@ -2368,7 +1781,6 @@ def _text_len_stats(chapters):
         "total_chars": sum(lengths),
     }
 
-
 def _source_breakdown(chapters):
     counts = {}
     for ch in chapters:
@@ -2376,13 +1788,8 @@ def _source_breakdown(chapters):
         counts[src] = counts.get(src, 0) + 1
     return counts
 
-
 def generate_diagnostic_report(path_a, path_b, output_path, step_timeout=90,
                                 ignore_linebreaks=True, run_pages=False, run_moves=True):
-    """Erzeugt einen JSON-Diagnose-Report OHNE jeglichen Requirement-/
-    Kapiteltext - nur Zahlen, Zeitdauern und Umgebungsinfo. Fuer die
-    Fehlersuche bei langsamen/haengenden Laeufen auf sensiblen Dokumenten,
-    die das eigene Netz nicht verlassen duerfen."""
     report = {
         "report_version": "1.0",
         "generated_at": datetime.now().isoformat(timespec="seconds"),
@@ -2441,7 +1848,7 @@ def generate_diagnostic_report(path_a, path_b, output_path, step_timeout=90,
         report["steps"][label] = step_report
 
     if chapters_a is None or chapters_b is None:
-        report["steps"]["aborted"] = "Kapitel-Extraktion fuer mindestens ein Dokument fehlgeschlagen/Timeout - weitere Schritte übersprungen."
+        report["steps"]["aborted"] = "Kapitel-Extraktion fuer mindestens ein Dokument fehlgeschlagen/Timeout."
         report_path = Path(output_path)
         report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
         return report_path
@@ -2498,7 +1905,6 @@ def generate_diagnostic_report(path_a, path_b, output_path, step_timeout=90,
     report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
     return report_path
 
-
 def _pdfplumber_available():
     try:
         import pdfplumber  # noqa: F401
@@ -2506,15 +1912,11 @@ def _pdfplumber_available():
     except ImportError:
         return False
 
-
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
 def diagnose_page_detection(soffice_explicit=None):
-    """Liefert eine Liste menschenlesbarer Diagnosezeilen, WARUM die Seiten-
-    Gruppierung nicht verfuegbar ist - fuer die Fehlersuche auf einem
-    konkreten Rechner (z.B. 'pywin32 fehlt' vs. 'soffice nicht gefunden')."""
     lines = []
 
     if sys.platform != "win32":
@@ -2522,28 +1924,25 @@ def diagnose_page_detection(soffice_explicit=None):
     else:
         try:
             import win32com.client
+            import pythoncom
         except ImportError:
             lines.append("MS Word/COM: pywin32 ist NICHT installiert. Installieren mit: pip install pywin32")
         else:
-            # Echten Verbindungsversuch machen statt nur zu raten - liefert
-            # die tatsaechliche COM-Fehlermeldung (z.B. "Word nicht
-            # installiert" vs. einen anderen, spezifischeren Fehler).
             word = None
             try:
+                pythoncom.CoInitialize()
                 word = win32com.client.DispatchEx("Word.Application")
-                lines.append("MS Word/COM: Verbindung zu Word erfolgreich aufgebaut - sollte also "
-                              "funktionieren. Falls trotzdem 'unavailable', liegt es an einem Fehler "
-                              "beim Oeffnen/Auslesen der konkreten Datei (evtl. geschuetzt oder korrupt).")
+                lines.append("MS Word/COM: Verbindung zu Word erfolgreich aufgebaut - sollte also funktionieren.")
             except Exception as exc:
-                lines.append(f"MS Word/COM: pywin32 ist installiert, aber die Verbindung zu Word "
-                              f"schlug fehl: {exc!r}. Das deutet meist darauf hin, dass MS Word auf "
-                              f"diesem Rechner gar nicht installiert ist (z.B. nur LibreOffice) - "
-                              f"dann ist dieser Weg hier erwartungsgemaess nicht nutzbar, LibreOffice "
-                              f"sollte aber greifen (siehe unten).")
+                lines.append(f"MS Word/COM: pywin32 ist installiert, aber die Verbindung zu Word schlug fehl: {exc!r}.")
             finally:
                 try:
                     if word is not None:
                         word.Quit()
+                except Exception:
+                    pass
+                try:
+                    pythoncom.CoUninitialize()
                 except Exception:
                     pass
 
@@ -2556,14 +1955,9 @@ def diagnose_page_detection(soffice_explicit=None):
             lines.append("pdfplumber: ist installiert - PDF-Seiten koennen gelesen werden.")
         except ImportError:
             pdfplumber_ok = False
-            lines.append("pdfplumber: ist NICHT installiert - das ist vermutlich der Grund, "
-                          "warum die Seiten-Gruppierung trotz gefundenem soffice nicht "
-                          "funktioniert! Installieren mit: pip install pdfplumber")
+            lines.append("pdfplumber: ist NICHT installiert! Installieren mit: pip install pdfplumber")
 
         if pdfplumber_ok:
-            # Echten End-to-End-Test: kleines Test-Dokument erzeugen, konvertieren,
-            # PDF lesen - deckt Konvertierungsfehler/Timeouts auf, die reine
-            # Existenzpruefung des Pfads nicht zeigen wuerde.
             try:
                 with tempfile.TemporaryDirectory() as tmp:
                     test_docx = Path(tmp) / "diagnose_test.docx"
@@ -2572,81 +1966,31 @@ def diagnose_page_detection(soffice_explicit=None):
                     Document_.save(test_docx)
                     result = render_page_texts(test_docx, soffice_path, timeout=60)
                 if result:
-                    lines.append("End-zu-End-Test: Testkonvertierung erfolgreich - die Seiten-"
-                                  "Gruppierung sollte funktionieren. Falls es bei den echten "
-                                  "Dokumenten trotzdem 'unavailable' zeigt, koennte es an genau "
-                                  "diesen Dateien liegen (z.B. Kennwortschutz, sehr grosse Datei, "
-                                  "Sonderzeichen im Dateinamen).")
+                    lines.append("End-zu-End-Test: Testkonvertierung erfolgreich.")
                 else:
-                    lines.append("End-zu-End-Test: Testkonvertierung ist FEHLGESCHLAGEN "
-                                  "(render_page_texts lieferte kein Ergebnis). Moegliche "
-                                  "Ursachen: soffice startet nicht richtig (evtl. laeuft schon "
-                                  "eine andere LibreOffice-Instanz und blockiert), oder das PDF "
-                                  "konnte nicht gelesen werden.")
+                    lines.append("End-zu-End-Test: Testkonvertierung ist FEHLGESCHLAGEN.")
             except Exception as exc:
                 lines.append(f"End-zu-End-Test: Fehler beim Testen: {exc!r}")
     else:
-        lines.append("LibreOffice: soffice wurde NICHT gefunden (weder im PATH noch an den "
-                      "ueblichen Installationspfaden). Pfad manuell angeben mit --soffice-path "
-                      "\"C:\\Pfad\\zu\\soffice.exe\" (den Pfad findest du z.B. per Rechtsklick auf "
-                      "die LibreOffice-Verknuepfung -> Dateipfad oeffnen).")
+        lines.append("LibreOffice: soffice wurde NICHT gefunden.")
     return lines
 
 
 def main():
     print(f"docx_chapter_compare.py Version {SCRIPT_VERSION} ({Path(__file__).resolve()})")
-    parser = argparse.ArgumentParser(
-        description="Vergleicht zwei Word-Dokumente anhand von Kapitelnummern und erzeugt einen HTML-Report."
-    )
+    parser = argparse.ArgumentParser(description="Vergleicht zwei Word-Dokumente anhand von Kapitelnummern.")
     parser.add_argument("doc_a", nargs="?", help="Pfad zum ersten (alten) .docx")
     parser.add_argument("doc_b", nargs="?", help="Pfad zum zweiten (neuen) .docx")
     parser.add_argument("-o", "--output", default="vergleich.html", help="Pfad der HTML-Ausgabedatei")
-    parser.add_argument(
-        "--keep-linebreaks", action="store_true",
-        help="Zeilen-/Absatzumbrueche NICHT ignorieren (strikter Vergleich). "
-             "Standard: Umbrueche werden ignoriert, nur der Wortinhalt zaehlt.",
-    )
-    parser.add_argument(
-        "--no-pages", action="store_true",
-        help="Seiten-Gruppierung ('Buchform') abschalten. Standard: an, sofern "
-             "LibreOffice (soffice) gefunden wird.",
-    )
-    parser.add_argument(
-        "--no-moves", action="store_true",
-        help="Erkennung moeglicher Kapitel-Verschiebungen abschalten. Standard: an.",
-    )
-    parser.add_argument(
-        "--soffice-path", default=None,
-        help="Expliziter Pfad zu soffice/soffice.exe, falls automatische Suche fehlschlaegt.",
-    )
-    parser.add_argument(
-        "--diagnose-pages", action="store_true",
-        help="Nur pruefen, warum die Seiten-Gruppierung (nicht) verfuegbar ist, und die "
-             "Diagnosezeilen ausgeben - ohne doc_a/doc_b, ohne Report zu erzeugen.",
-    )
-    parser.add_argument(
-        "--docx", nargs="?", const="", default=None, metavar="PFAD",
-        help="Zusaetzlich einen kompakten Word-Report erzeugen (fuer schnelle Orientierung, "
-             "z.B. Weitergabe im Unternehmen ohne Browser). Ohne PFAD wird der Name der "
-             "HTML-Ausgabe mit .docx-Endung verwendet.",
-    )
-    parser.add_argument(
-        "--review-json", default=None, metavar="PFAD",
-        help="Zuvor per 'Review exportieren' gespeicherte JSON-Datei einlesen und die "
-             "Bewertungen (Status/Kommentar) in den Word-Report mit aufnehmen.",
-    )
-    parser.add_argument(
-        "--diagnostic-report", nargs="?", const="", default=None, metavar="PFAD",
-        help="Statt eines normalen Vergleichs einen Diagnose-Report (JSON) erzeugen: "
-             "Zeitdauer je Verarbeitungsschritt + Struktur-Kennzahlen (Absatz-/Kapitelanzahl, "
-             "Textlaengen, etc.) - ENTHAELT NIE den Kapitel-/Anforderungstext selbst. Fuer die "
-             "Fehlersuche bei langsamen/haengenden Laeufen auf Dokumenten, die nicht "
-             "weitergegeben werden duerfen. Ohne PFAD wird 'diagnose_report.json' verwendet.",
-    )
-    parser.add_argument(
-        "--diagnostic-step-timeout", type=int, default=90, metavar="SEKUNDEN",
-        help="Timeout je Schritt im Diagnose-Report-Modus (Standard: 90s).",
-    )
+    parser.add_argument("--keep-linebreaks", action="store_true", help="Zeilen-/Absatzumbrueche NICHT ignorieren.")
+    parser.add_argument("--no-pages", action="store_true", help="Seiten-Gruppierung abschalten.")
+    parser.add_argument("--no-moves", action="store_true", help="Verschiebungs-Erkennung abschalten.")
+    parser.add_argument("--soffice-path", default=None, help="Expliziter Pfad zu soffice.exe.")
+    parser.add_argument("--diagnose-pages", action="store_true", help="Nur Diagnose fuer Seiten-Gruppierung.")
+    parser.add_argument("--docx", nargs="?", const="", default=None, metavar="PFAD", help="Word-Report erzeugen.")
+    parser.add_argument("--review-json", default=None, metavar="PFAD", help="Review JSON-Datei einlesen.")
+    parser.add_argument("--diagnostic-report", nargs="?", const="", default=None, metavar="PFAD", help="Diagnose-Report erzeugen.")
+    parser.add_argument("--diagnostic-step-timeout", type=int, default=90, metavar="SEKUNDEN", help="Timeout je Schritt.")
     args = parser.parse_args()
 
     if args.diagnose_pages:
@@ -2665,8 +2009,6 @@ def main():
                 print(f"Datei nicht gefunden: {p}", file=sys.stderr)
                 sys.exit(1)
         out_path = Path(args.diagnostic_report or "diagnose_report.json")
-        print(f"Erzeuge Diagnose-Report (Schritt-Timeout: {args.diagnostic_step_timeout}s) ...")
-        print("Enthaelt AUSSCHLIESSLICH Zahlen/Zeitdauern, nie den Kapitel-/Anforderungstext.")
         report_path = generate_diagnostic_report(
             path_a, path_b, out_path,
             step_timeout=args.diagnostic_step_timeout,
@@ -2674,11 +2016,9 @@ def main():
             run_pages=not args.no_pages, run_moves=not args.no_moves,
         )
         print(f"Diagnose-Report geschrieben: {report_path.resolve()}")
-        print("Diese Datei kann gefahrlos weitergegeben werden (keine Inhalte enthalten).")
         sys.exit(0)
 
     ignore_linebreaks = not args.keep_linebreaks
-
     path_a, path_b = Path(args.doc_a), Path(args.doc_b)
     for p in (path_a, path_b):
         if not p.exists():
@@ -2688,43 +2028,19 @@ def main():
     chapters_a = extract_chapters(path_a)
     chapters_b = extract_chapters(path_b)
 
-    if not chapters_a or not chapters_b:
-        print("Warnung: In mindestens einem Dokument wurden keine Kapitel erkannt "
-              "(keine Heading-Formatvorlagen und kein Kapitelnummern-Muster gefunden).",
-              file=sys.stderr)
-
     pages_method = None
     diagnostics = None
     if not args.no_pages:
-        print("Preflight-Check Seiten-Gruppierung ...")
         diagnostics = diagnose_page_detection(args.soffice_path)
-        for line in diagnostics:
-            print(f"  - {line}")
-
-        print("Ermittle Seiten (MS Word COM, sonst LibreOffice) - kann einige Sekunden dauern ...")
         method = attach_pages(chapters_a, chapters_b, path_a, path_b, soffice_path=args.soffice_path)
         pages_method = method if method is not None else "unavailable"
-        if method == "word_com":
-            print("Seiten via MS Word ermittelt (exakt).")
-        elif method == "libreoffice":
-            print("Seiten via LibreOffice ermittelt (Näherung).")
-        else:
-            print("Hinweis: Weder MS Word (COM/pywin32) noch LibreOffice (soffice) verfügbar - "
-                  "Seiten-Gruppierung wird ausgelassen. Details siehe Preflight-Check oben "
-                  "(auch im HTML-Report unter 'Preflight-Diagnose' zu finden).", file=sys.stderr)
 
     rows = build_comparison(chapters_a, chapters_b, ignore_linebreaks=ignore_linebreaks)
     stats = compute_stats(chapters_a, chapters_b, rows)
     moves = None
     moves_complete = True
     if not args.no_moves:
-        print("Suche mögliche Verschiebungen (Zeitbudget 8s) ...")
         moves, moves_complete = detect_possible_moves(rows)
-        if moves:
-            print(f"Mögliche Verschiebungen erkannt: {len(moves)} (siehe Report für Details)")
-        if not moves_complete:
-            print("Hinweis: Zeitbudget für Verschiebungs-Erkennung ausgeschöpft - "
-                  "Ergebnis ist unvollständig (siehe Hinweis im Report).", file=sys.stderr)
 
     out_html = render_html(
         rows, stats, path_a.name, path_b.name, ignore_linebreaks=ignore_linebreaks,
@@ -2735,9 +2051,6 @@ def main():
     out_path.write_text(out_html, encoding="utf-8")
 
     print(f"Report geschrieben: {out_path.resolve()}")
-    print(f"Kapitel A: {stats['total_a']} | Kapitel B: {stats['total_b']} | "
-          f"unveraendert: {stats['unchanged']} | geaendert: {stats['changed']} | "
-          f"neu: {stats['new']} | geloescht: {stats['deleted']}")
 
     if args.docx is not None:
         docx_path = Path(args.docx) if args.docx else out_path.with_suffix(".docx")
@@ -2747,14 +2060,12 @@ def main():
                 review_data = json.loads(Path(args.review_json).read_text(encoding="utf-8"))
                 reviews = review_data.get("reviews", {})
             except Exception as exc:
-                print(f"Warnung: Review-JSON konnte nicht gelesen werden ({exc}) - "
-                      f"Word-Report wird ohne Review-Spalte erzeugt.", file=sys.stderr)
+                print(f"Warnung: Review-JSON konnte nicht gelesen werden ({exc})", file=sys.stderr)
         generate_docx_report(
             rows, stats, path_a.name, path_b.name, docx_path,
             meta_a=doc_metadata(path_a), meta_b=doc_metadata(path_b), reviews=reviews,
         )
         print(f"Word-Report geschrieben: {docx_path.resolve()}")
-
 
 if __name__ == "__main__":
     main()

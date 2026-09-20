@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
 """
 docx_chapter_compare.py
-Version 3.2 / 2026-09-17 / Grund: Wichtiger Bugfix - Kapitel-Erkennung
-    unterstuetzte bisher nur EINEN von drei ueblichen Word-Mechanismen fuer
-    automatische Nummerierung ("mit Formatvorlage verknuepft" direkt in
-    numbering.xml). Ein echtes Testdokument (90 Kapitel) nutzte stattdessen
-    den haeufigeren Weg - Nummerierung DIREKT am Absatz (<w:pPr><w:numPr>) -
-    und wurde deshalb komplett als EIN einziges Fallback-Kapitel erkannt
-    (89 von 90 Kapiteln fielen unter den Tisch, dadurch waren logischerweise
-    auch alle Seitenzahlen witzlos falsch - das eigentliche Problem lag also
-    nicht an der Seiten-Erkennung selbst). Jetzt werden alle drei Wege
-    unterstuetzt: (1) Numerierung direkt am Absatz, (2) Numerierung an der
-    Formatvorlage selbst (styles.xml), (3) "mit Formatvorlage verknuepft" in
-    numbering.xml (bisheriger Mechanismus). Mit einem realen 90-Kapitel-
-    Testdokument gegen 3 von Hand geprueften Referenz-Seitenzahlen aus MS
-    Word verifiziert (alle 3 exakt getroffen).
+Version 3.3 / 2026-09-20 / Grund: WICHTIGER Sicherheitsfix (Nutzerhinweis:
+    auf dem Firmenrechner ist MS Word haeufig bereits mit anderen Dokumenten
+    geoeffnet, waehrend das Tool laeuft) - assign_pages_via_word_com() rief
+    bisher bedingungslos word.Quit() auf der per DispatchEx erzeugten
+    Word-Instanz auf. DispatchEx SOLL zwar immer eine neue, eigenstaendige
+    Instanz erzeugen (getrennt von einer bereits laufenden Sitzung des
+    Nutzers), aber falls das aus irgendeinem Grund (Word-Version/Konfiguration)
+    nicht sauber funktioniert, haette ein bedingungsloses Quit() moeglicherweise
+    die ECHTE, sichtbare Word-Sitzung des Nutzers mitsamt anderer offener,
+    ungespeicherter Dokumente geschlossen. Jetzt zwei Absicherungen: (1) direkt
+    nach DispatchEx wird geprueft, ob die neue Instanz bereits Dokumente
+    enthaelt (waere ein Hinweis auf eine geteilte statt neue Instanz) - falls
+    ja, sofortiger, sauberer Abbruch (Rueckfall auf LibreOffice) OHNE
+    irgendetwas an dieser Instanz zu veraendern; (2) word.Quit() wird im
+    finally-Block nur noch aufgerufen, wenn in der Instanz nachweislich keine
+    Dokumente mehr offen sind. Aendert im Normalfall (DispatchEx verhaelt sich
+    korrekt) nichts am Verhalten.
 
 Vergleicht zwei Word-Dokumente (.docx) auf Basis von Kapitelnummern als
 Fixpunkten und erzeugt einen eigenstaendigen HTML-Report:
@@ -62,7 +65,7 @@ from docx.oxml.ns import qn
 from docx.shared import Pt, RGBColor, Twips
 from lxml import etree
 
-SCRIPT_VERSION = "3.2"
+SCRIPT_VERSION = "3.3"
 REVIEW_SCHEMA_VERSION = "1.0"
 
 REVIEW_STATUS_OPTIONS = [
@@ -647,10 +650,22 @@ def assign_pages_via_word_com(chapters, docx_path, timeout=120):
     doc = None
     try:
         word = win32com.client.DispatchEx("Word.Application")
+        # Sicherheitscheck: DispatchEx soll eine NEUE, eigenstaendige
+        # Word-Instanz erzeugen (unabhaengig von einer evtl. bereits
+        # laufenden, sichtbaren Word-Sitzung des Nutzers mit anderen offenen
+        # Dokumenten). Sind hier trotzdem schon Dokumente vorhanden, deutet
+        # das darauf hin, dass wir uns technisch an eine bestehende Instanz
+        # "angehaengt" haben statt eine eigene zu bekommen - in dem Fall
+        # brechen wir lieber sofort und sauber ab (kein Oeffnen weiterer
+        # Dokumente in einer fremden Instanz, kein spaeteres Quit()-Risiko),
+        # statt moeglicherweise die Arbeit des Nutzers zu stoeren.
+        if word.Documents.Count > 0:
+            return False
         word.Visible = False
         word.DisplayAlerts = 0
         doc = word.Documents.Open(
             str(Path(docx_path).resolve()), ReadOnly=True, AddToRecentFiles=False, Visible=False,
+            ConfirmConversions=False,
         )
         # WICHTIG: Bei unsichtbar (Visible=False) geoeffneten Dokumenten
         # berechnet Word die Seitenumbrueche teils nicht zuverlaessig neu,
@@ -727,7 +742,20 @@ def assign_pages_via_word_com(chapters, docx_path, timeout=120):
             pass
         try:
             if word is not None:
-                word.Quit()
+                # WICHTIG (Sicherheitsfix): word.Quit() nur aufrufen, wenn in
+                # dieser Instanz nachweislich KEINE anderen Dokumente mehr
+                # offen sind. DispatchEx soll zwar immer eine eigene, neue
+                # Word-Instanz erzeugen (getrennt von einer bereits laufenden,
+                # sichtbaren Word-Sitzung mit anderen offenen Dokumenten) -
+                # sollte das aus irgendeinem Grund (Word-Version, Konfiguration)
+                # doch nicht sauber getrennt sein, wuerde ein bedingungsloses
+                # Quit() sonst moeglicherweise die ECHTE Word-Sitzung des
+                # Nutzers mitsamt anderer offener, ungespeicherter Dokumente
+                # schliessen. Das darf unter keinen Umstaenden passieren -
+                # im Zweifel bleibt die (dann vermutlich fremde) Instanz
+                # einfach offen, statt ein Risiko einzugehen.
+                if word.Documents.Count == 0:
+                    word.Quit()
         except Exception:
             pass
 

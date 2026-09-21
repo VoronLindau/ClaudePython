@@ -1,20 +1,7 @@
 #!/usr/bin/env python3
 """
 docx_chapter_compare_gui.py
-Version 2.4 / 2026-09-20 / Grund: Zwei Ergänzungen aus dem Praxistest in der
-    Firma: (1) Splash-Screen mit Firmenlogo (FirmenLogo.JPG, 5 Sekunden,
-    Pillow-Animation mit Fallback falls Pillow fehlt); (2) Ausgabedateiname
-    wird jetzt automatisch um ".html" ergänzt, falls die Endung beim freien
-    Eintippen ins Textfeld fehlt oder falsch ist (vorher nur über den
-    "Speichern unter…"-Dialog sichergestellt, nicht beim manuellen Eintippen -
-    ein fehlendes ".html" lässt Browser/den lokalen HTTP-Server den
-    Content-Type nicht mehr korrekt erkennen, Bericht erscheint dann nur als
-    Rohtext statt gerendert). Der lokale-HTTP-Server-Mechanismus selbst
-    (siehe v2.3) ist unverändert, keine neue Änderung in dieser Version.
-
-Desktop-GUI (Tkinter, keine Zusatz-Installation noetig) fuer den
-Kapitelvergleich zweier Word-Dokumente. Nutzt dieselbe Vergleichslogik und
-denselben HTML-Report wie docx_chapter_compare.py.
+Version 2.6 / 2026-09-21 / Grund: Update passend zu docx_chapter_compare.py Version 3.9
 """
 
 import json
@@ -27,7 +14,7 @@ import webbrowser
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-GUI_VERSION = "2.4"
+GUI_VERSION = "2.6"
 
 try:
     import docx_chapter_compare as _core
@@ -176,20 +163,18 @@ class CompareApp(tk.Tk):
 
 
     def _show_splash_and_start(self):
-        self.withdraw()  # Versteckt das Hauptfenster temporär
+        self.withdraw()  
         
         splash = tk.Toplevel(self)
         splash.overrideredirect(True)
         splash.attributes('-topmost', True)
         
-        # Fenster zentrieren (feste Größe)
         width, height = 450, 300
         x = (splash.winfo_screenwidth() - width) // 2
         y = (splash.winfo_screenheight() - height) // 2
         splash.geometry(f"{width}x{height}+{x}+{y}")
         splash.configure(background="white")
         
-        # Rahmenloses Frame für das gesamte Fenster
         frame = tk.Frame(splash, bg="white")
         frame.pack(fill="both", expand=True)
         
@@ -197,11 +182,9 @@ class CompareApp(tk.Tk):
         logo_path = script_dir / "FirmenLogo.JPG"
         logo_loaded = False
         
-        # 1. BILD-EBENE: Label für das vollflächige Bild
         self._splash_label = tk.Label(frame, bg="white")
         self._splash_label.place(x=0, y=0, width=width, height=height)
         
-        # 2. TEXT-EBENE: Label für die Versionsnummer (liegt ÜBER dem Bild)
         version_label = tk.Label(
             frame, 
             text=f"Lade Version {GUI_VERSION} (Core {CORE_VERSION})...", 
@@ -216,34 +199,30 @@ class CompareApp(tk.Tk):
         if logo_path.exists():
             try:
                 from PIL import Image, ImageTk, ImageDraw
-                import math  # Wird für die fließende Spot-Kurve benötigt
+                import math  
                 
-                # Bild EXAKT auf die Fenstergröße strecken
                 img = Image.open(logo_path).convert("RGBA")
                 resample_filter = getattr(Image, 'Resampling', Image).LANCZOS 
                 img = img.resize((width, height), resample_filter)
                 w, h = img.size
                 
-                # --- LICHTEFFEKT GENERIEREN (WEICHER SPOTLIGHT) ---
-                spot_size = int(max(w, h) * 0.8)  # Der Spot füllt ca. 80% der Fensterhöhe
+                spot_size = int(max(w, h) * 0.8)  
                 spot = Image.new("RGBA", (spot_size, spot_size), (255, 255, 255, 0))
                 draw = ImageDraw.Draw(spot)
                 
                 cx, cy = spot_size // 2, spot_size // 2
                 radius = spot_size // 2
                 
-                # Wir zeichnen Kreise von außen nach innen, die zur Mitte hin immer deckender werden
                 for r_step in range(radius, 0, -2):
                     dist = r_step / radius
-                    alpha = int(170 * (1 - dist**2))  # 170 ist die maximale Helligkeit im Zentrum
+                    alpha = int(170 * (1 - dist**2))  
                     draw.ellipse(
                         [(cx - r_step, cy - r_step), (cx + r_step, cy + r_step)], 
                         fill=(255, 255, 255, alpha)
                     )
                 
-                # --- ANIMATIONS-SCHLEIFE ---
                 self._anim_frame = 0
-                self._anim_max_frames = 100  # Etwas mehr Frames = flüssigere Bewegung
+                self._anim_max_frames = 100  
                 
                 def update_animation():
                     if not splash.winfo_exists():
@@ -251,13 +230,9 @@ class CompareApp(tk.Tk):
                         
                     progress = (self._anim_frame % self._anim_max_frames) / self._anim_max_frames
                     
-                    if progress < 0.65:  # 65% der Zeit wandert der Spot, danach Pause
+                    if progress < 0.65:  
                         eff_progress = progress / 0.65
-                        
-                        # 1. Wandert horizontal von links (-spot_size) bis ganz nach rechts (w)
                         current_x = int(-spot_size + eff_progress * (w + spot_size))
-                        
-                        # 2. Wandert vertikal in einem leichten Bogen (Sinuskurve)
                         base_y = (h - spot_size) / 2
                         current_y = int(base_y + math.sin(eff_progress * math.pi) * (h * 0.15))
                         
@@ -289,13 +264,12 @@ class CompareApp(tk.Tk):
             fallback_label = tk.Label(frame, text="Kapitelvergleich Tool", font=("Arial", 16, "bold"), bg="white")
             fallback_label.place(relx=0.5, rely=0.4, anchor="center")
             
-        # Splash nach 5 Sekunden ausblenden
         self.after(5000, lambda: self._close_splash(splash))
  
  
     def _close_splash(self, splash):
         splash.destroy()
-        self.deiconify() # Stellt das normale GUI-Fenster wieder her
+        self.deiconify() 
 
     def _build_ui(self):
         frame = ttk.Frame(self)
@@ -402,12 +376,7 @@ class CompareApp(tk.Tk):
         path_a = Path(self.var_a.get().strip())
         path_b = Path(self.var_b.get().strip())
         out_path = Path(self.var_out.get().strip() or (default_output_dir() / "vergleich.html"))
-        # WICHTIG: Fehlt die Endung (z.B. weil frei ins Textfeld getippt statt
-        # ueber "Speichern unter..." gewaehlt), wird sie hier automatisch
-        # ergaenzt statt stillschweigend eine erweiterungslose Datei zu
-        # erzeugen - eine Datei ohne ".html" wird von manchen Browsern/vom
-        # lokalen HTTP-Server nicht als HTML erkannt (falscher/fehlender
-        # Content-Type) und dann nur als Rohtext angezeigt statt gerendert.
+
         if out_path.suffix.lower() != ".html":
             out_path = out_path.with_name(out_path.name + ".html") if out_path.suffix else out_path.with_suffix(".html")
             self.var_out.set(str(out_path))
@@ -477,10 +446,11 @@ class CompareApp(tk.Tk):
 
             pages_method = None
             diagnostics = None
+            toc_info = None
             if detect_pages:
                 diagnostics = _core.diagnose_page_detection()
                 advance("Preflight-Check Seiten-Gruppierung")
-                method = attach_pages(chapters_a, chapters_b, path_a, path_b)
+                method, toc_info = attach_pages(chapters_a, chapters_b, path_a, path_b)
                 pages_method = method if method is not None else "unavailable"
                 advance("Seiten ermitteln")
 
@@ -498,6 +468,7 @@ class CompareApp(tk.Tk):
                 rows, stats, path_a.name, path_b.name, ignore_linebreaks=ignore_linebreaks,
                 meta_a=doc_metadata(path_a), meta_b=doc_metadata(path_b),
                 pages_method=pages_method, diagnostics=diagnostics, moves=moves, moves_complete=moves_complete,
+                toc_info=toc_info,
             )
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text(out_html, encoding="utf-8")

@@ -1,47 +1,16 @@
 #!/usr/bin/env python3
 """
 docx_chapter_compare.py
-Version 3.5 / 2026-09-20 / Grund: Wichtiger Bugfix - Inhaltsverzeichnis,
-    Abbildungs- und Tabellenverzeichnis am Dokumentanfang wurden bisher NICHT
-    von der Kapitel-Erkennung ausgeschlossen. Automatisch generierte Word-
-    Verzeichnisse rendern ihre Eintraege oft im selben "NUMMER<TAB>Text
-    <TAB>Seitenzahl"-Muster wie echte Kapitelanfaenge - wurden dadurch
-    faelschlich als eigene Phantom-Kapitel VOR den echten Kapiteln erkannt
-    (reproduziert mit Testdatei: exakt dieselben Kapitelnummern erschienen
-    doppelt - einmal aus dem Verzeichnis, einmal aus dem echten Inhalt).
-    Das brachte nicht nur die Kapitelliste durcheinander, sondern vor allem
-    die anschliessende Seitenzuordnung (Cursor "verbrauchte" die falschen,
-    zu frueh liegenden ToC-Fundstellen zuerst) - beobachtet als "keine
-    Seitenzahl vor Seite 4" bei einem realen Firmendokument mit ToC+List of
-    Figures+List of Tables vor den eigentlichen Kapiteln. Neue Erkennung:
-    ein "Verzeichnis-Modus" startet bei einer erkannten Verzeichnis-
-    Ueberschrift (Inhaltsverzeichnis/Abbildungsverzeichnis/Tabellen-
-    verzeichnis/Glossar, auch englisch) und endet automatisch entweder bei
-    einer ECHTEN formatvorlagen-numerierten Ueberschrift (starkes Signal:
-    Verzeichniseintraege selbst sind nie so numeriert) oder bei einem
-    ausreichend langen Absatz (>200 Zeichen - Verzeichniseintraege sind
-    immer kurz, echter Fliesstext praktisch nie). Mit Regressionstest
-    gegen alle bisherigen Testdateien verifiziert (keine Aenderung an
-    bekannten Kapitelzahlen).
+Version 3.10 / 2026-09-21 / Grund: Bugfix für Inhalts- und Abbildungsverzeichnisse 
+    in bestimmten Export-Formaten (z.B. DOORS). 1) Das Schlüsselwort "Inhalt" wurde 
+    zu den Erkennungs-Headings hinzugefügt. 2) Intelligenter TOC-Exit: Unterscheidet
+    jetzt bei identischen Texten exakt zwischen Verzeichniseintrag (endet auf Tab + 
+    Seitenzahl) und echter Überschrift (keine Seitenzahl am Ende). 3) Das Inhalts- 
+    und Abbildungsverzeichnis wird nicht mehr gelöscht, sondern als intelligenter, 
+    vergleichbarer Gesamt-Block ("Inhalt") ganz oben in den HTML-Report eingefügt.
 
 Vergleicht zwei Word-Dokumente (.docx) auf Basis von Kapitelnummern als
-Fixpunkten und erzeugt einen eigenstaendigen HTML-Report:
-- linke Spalte = Dokument A, rechte Spalte = Dokument B
-- jede Zeile = ein Kapitel (gematcht ueber Kapitelnummer)
-- farbige Verbindungslinie in der Mittelspalte zeigt die Beziehung:
-    gruen   = unveraendert
-    orange  = geaendert (inkl. Wort-Diff-Highlighting im Text)
-    blau    = neu (nur in Dokument B)
-    rot     = geloescht (nur in Dokument A)
-- Statistik-Leiste oben mit Anzahl je Kategorie
-- "Nur Unterschiede anzeigen"-Filter (Client-seitig, kein Server noetig)
-
-Nutzung (CLI):
-    python docx_chapter_compare.py alt.docx neu.docx -o report.html
-    (Report danach einfach per Doppelklick im Browser oeffnen)
-
-Nutzung (GUI):
-    python docx_chapter_compare_gui.py
+Fixpunkten und erzeugt einen eigenstaendigen HTML-Report.
 """
 
 import argparse
@@ -70,7 +39,7 @@ from docx.oxml.ns import qn
 from docx.shared import Pt, RGBColor, Twips
 from lxml import etree
 
-SCRIPT_VERSION = "3.5"
+SCRIPT_VERSION = "3.10"
 REVIEW_SCHEMA_VERSION = "1.0"
 
 REVIEW_STATUS_OPTIONS = [
@@ -278,28 +247,16 @@ def _extract_images(paragraph):
     return images
 
 
-# Ueberschriften-Texte, die typischerweise ein Verzeichnis einleiten
-# (Inhalts-, Abbildungs-, Tabellen-, Abkuerzungsverzeichnis). Automatisch
-# generierte Word-Verzeichnisse rendern ihre Eintraege oft im selben
-# "NUMMER<TAB>Text<TAB>Seitenzahl"-Muster wie echte Kapitelanfaenge (mit
-# Tab-Fuehrungspunkten zur Seitenzahl) - ohne Ausschluss wuerden solche
-# Eintraege faelschlich als eigene (Phantom-)Kapitel erkannt, VOR den
-# tatsaechlichen Kapiteln im Dokument. Das verwirrt sowohl die Kapitelliste
-# selbst als auch - noch gravierender - die anschliessende Seitenzuordnung
-# (der Cursor "verbraucht" die falschen, zu frueh liegenden Fundstellen).
 _TOC_HEADING_TEXTS = {
-    "inhaltsverzeichnis", "table of contents", "contents",
+    "inhaltsverzeichnis", "inhalt", "table of contents", "contents",
     "abbildungsverzeichnis", "list of figures",
     "tabellenverzeichnis", "list of tables",
     "abkürzungsverzeichnis", "abkuerzungsverzeichnis", "list of abbreviations",
     "glossar", "glossary",
 }
-# Verzeichniseintraege sind fast immer kurz (nur Titel + Seitenzahl) -
-# echter Fliesstext eines Kapitels ist praktisch immer deutlich laenger.
-# Dient als Ausstiegs-Signal aus dem Verzeichnis-Modus, falls kein Heading-
-# Stil zur Verfuegung steht (siehe unten).
 _TOC_EXIT_TEXT_LEN = 200
-
+# Sucht am Ende der Zeile nach Punktlinien oder Tabulatoren gefolgt von einer Ziffer (Seitenzahl)
+_TOC_LINE_RE = re.compile(r"(?:\.{5,}|\t)[ \t]*\d+[ \t]*$")
 
 def extract_chapters(docx_path):
     doc = Document(docx_path)
@@ -313,6 +270,8 @@ def extract_chapters(docx_path):
     fallback_counter = 0
     current_para_idx = -1
     in_toc_section = False
+    toc_section_para_count = 0
+    _TOC_SECTION_MAX_PARAS = 1500
 
     def new_chapter(number, source="fallback"):
         nonlocal current, fallback_counter
@@ -343,22 +302,35 @@ def extract_chapters(docx_path):
         text = para.text.strip()
         imgs = _extract_images(para)
 
-        # Verzeichnis-Modus: startet bei einer erkannten Verzeichnis-
-        # Ueberschrift, endet automatisch entweder bei einer ECHTEN
-        # formatvorlagen-numerierten Ueberschrift (starkes Signal fuer
-        # "hier beginnt jetzt ein echtes Kapitel" - Verzeichniseintraege
-        # selbst sind nie formatvorlagen-numeriert) oder bei einem
-        # ausreichend langen Absatz (echter Fliesstext statt kurzer
-        # Verzeichniszeile). Waehrend des Modus wird jeglicher Absatz
-        # komplett ignoriert - weder Nummer-Erkennung noch Text-Anhaengen.
-        if text.strip().lower().rstrip(":") in _TOC_HEADING_TEXTS:
+        text_lower = text.strip().lower().rstrip(":")
+        if text_lower in _TOC_HEADING_TEXTS:
             in_toc_section = True
+            toc_section_para_count = 0
+            pending_numbers.clear()
+            # Das Verzeichnis als separates "Kapitel" anlegen, damit es im Report verglichen wird
+            new_chapter(text.strip(), source="toc_heading")
             continue
+            
         if in_toc_section:
+            toc_section_para_count += 1
+            is_real_heading = False
             auto_number_probe = numberer.number_for_paragraph(para)
-            if auto_number_probe is None and len(text) < _TOC_EXIT_TEXT_LEN:
-                continue  # weiterhin im Verzeichnis-Bereich - Zeile ignorieren
-            in_toc_section = False  # Bereich verlassen, dieser Absatz wird normal verarbeitet
+            
+            # Pürfen, ob der Verzeichnis-Modus verlassen werden soll (weil ein echtes Kapitel beginnt)
+            if auto_number_probe is not None:
+                is_real_heading = True
+            elif ANCHOR_TAB_RE.match(text) or DOT_CONTINUATION_RE.match(text) or BARE_NUMBER_RE.match(text):
+                # Echte Überschrift (hat im Gegensatz zum TOC keinen Tabulator/Zahl am Ende)
+                if not _TOC_LINE_RE.search(text):
+                    is_real_heading = True
+                    
+            if not is_real_heading and len(text) < _TOC_EXIT_TEXT_LEN and toc_section_para_count < _TOC_SECTION_MAX_PARAS:
+                append_text(text)
+                if imgs:
+                    append_images(imgs)
+                continue
+            
+            in_toc_section = False
 
         auto_number = numberer.number_for_paragraph(para)
         if auto_number is not None:
@@ -478,28 +450,60 @@ def render_page_texts(docx_path, soffice_path, timeout=90):
     except Exception:
         return None
 
+def _detect_toc_end_page(page_texts, max_scan_pages=15, min_toc_lines=2):
+    last_toc_page = -1
+    pattern = re.compile(r"(?:^|[\n])[ \t]*(?:Abbildung|Figure|Table|Tabelle|[\d\.]+)[^\n]{2,200}?(?:\.{4,}|\t|\s{3,})\d+[ \t]*(?=[\n]|$)", re.IGNORECASE)
+    
+    for i, text in enumerate(page_texts[:max_scan_pages]):
+        matches = list(pattern.finditer(text))
+        dot_matches = list(re.finditer(r"\.{10,}", text))
+        
+        if len(matches) >= min_toc_lines or len(dot_matches) >= min_toc_lines:
+            last_toc_page = i
+        elif last_toc_page != -1 and i == last_toc_page + 1:
+            if len(matches) > 0 or len(dot_matches) > 0:
+                last_toc_page = i
+    return last_toc_page
+
+
 def assign_pages_to_chapters(chapters, page_texts, key_len=40):
     if not page_texts:
         for ch in chapters:
             ch["page"] = None
-        return
+        return 0
 
+    toc_end_page = _detect_toc_end_page(page_texts)
     page_idx = 0
     cursor = 0
     for ch in chapters:
-        key = normalize_whitespace(ch["text"])[:key_len]
+        is_toc = ch.get("_source") == "toc_heading"
+        if is_toc:
+            key = ch["number"][:key_len]
+        else:
+            # Reelle Kapitel springen zur Sicherheit IMMER über das Inhaltsverzeichnis
+            if toc_end_page >= 0 and page_idx <= toc_end_page:
+                page_idx = toc_end_page + 1
+                cursor = 0
+                
+            text_lines = [line.strip() for line in ch.get("text", "").split('\n') if line.strip()]
+            best_line = ""
+            for line in text_lines[:3]:
+                if len(line) > len(best_line):
+                    best_line = line
+            key = normalize_whitespace(best_line)[:key_len]
+            
         if key:
             while True:
+                if page_idx >= len(page_texts):
+                    break
                 pos = page_texts[page_idx].find(key, cursor)
                 if pos != -1:
                     cursor = pos + len(key)
                     break
-                if page_idx + 1 < len(page_texts):
-                    page_idx += 1
-                    cursor = 0
-                else:
-                    break
-        ch["page"] = page_idx + 1
+                page_idx += 1
+                cursor = 0
+        ch["page"] = page_idx + 1 if page_idx < len(page_texts) else None
+    return toc_end_page + 1 if toc_end_page >= 0 else 0
 
 def find_word_com():
     if sys.platform != "win32":
@@ -512,25 +516,26 @@ def find_word_com():
 
 def assign_pages_via_word_com(chapters, docx_path, timeout=120):
     if sys.platform != "win32":
-        return False
+        return False, False
     try:
         import pywintypes
         import win32com.client
         import pythoncom
     except ImportError:
-        return False
+        return False, False
 
     if not chapters:
-        return False
+        return False, False
 
     word = None
     doc = None
+    toc_detected = False
     try:
         pythoncom.CoInitialize()
         word = win32com.client.DispatchEx("Word.Application")
         
         if word.Documents.Count > 0:
-            return False
+            return False, False
         word.Visible = False
         word.DisplayAlerts = 0
         doc = word.Documents.Open(
@@ -557,8 +562,57 @@ def assign_pages_via_word_com(chapters, docx_path, timeout=120):
         cursor_start = 0
         found_count = 0
 
+        # Verzeichnisse per nativer Word-Funktion überspringen
+        toc_cursor_jump = 0
+        try:
+            for toc in doc.TablesOfContents:
+                if toc.Range.End > toc_cursor_jump:
+                    toc_cursor_jump = toc.Range.End
+                    toc_detected = True
+            for tof in doc.TablesOfFigures:
+                if tof.Range.End > toc_cursor_jump:
+                    toc_cursor_jump = tof.Range.End
+                    toc_detected = True
+        except Exception:
+            pass
+
+        # Fallback für rein textbasierte Verzeichnisse (z.B. DOORS-Exporte)
+        try:
+            probe_text = doc.Content.Text[:30000]
+            pattern = re.compile(r"(?:^|[\r\n])[ \t]*(?:Abbildung|Figure|Table|Tabelle|[\d\.]+)[^\r\n]{2,200}?(?:\.{5,}|\t)[ \t]*\d+[ \t]*(?=[\r\n]|$)", re.IGNORECASE)
+            toc_matches = list(pattern.finditer(probe_text))
+            if len(toc_matches) >= 2:
+                last_end = toc_matches[-1].end()
+                if last_end > toc_cursor_jump:
+                    toc_cursor_jump = last_end
+                    toc_detected = True
+                    
+            dot_matches = list(re.finditer(r"\.{10,}", probe_text))
+            if len(dot_matches) >= 3:
+                last_dot_end = dot_matches[-1].end()
+                if last_dot_end > toc_cursor_jump:
+                    toc_cursor_jump = last_dot_end
+                    toc_detected = True
+        except Exception:
+            pass
+
         for ch in chapters:
-            key = normalize_whitespace(ch.get("text", ""))[:FIND_KEY_LEN]
+            is_toc = ch.get("_source") == "toc_heading"
+            if is_toc:
+                key = ch["number"][:FIND_KEY_LEN]
+            else:
+                # Echte Kapitel springen immer erst NACH das Inhaltsverzeichnis
+                if cursor_start < toc_cursor_jump:
+                    cursor_start = toc_cursor_jump
+                
+                # Zeilenumbrüche sauber handhaben (fixt "ASasdA Asd saD" Absturz)
+                text_lines = [line.strip() for line in ch.get("text", "").split('\n') if line.strip()]
+                best_line = ""
+                for line in text_lines[:3]:
+                    if len(line) > len(best_line):
+                        best_line = line
+                key = normalize_whitespace(best_line)[:FIND_KEY_LEN]
+
             if not key or cursor_start >= doc_end:
                 ch["page"] = None
                 continue
@@ -582,9 +636,9 @@ def assign_pages_via_word_com(chapters, docx_path, timeout=120):
             except Exception:
                 ch["page"] = None
 
-        return found_count > 0
+        return found_count > 0, toc_detected
     except Exception:
-        return False
+        return False, False
     finally:
         try:
             if doc is not None:
@@ -604,15 +658,18 @@ def assign_pages_via_word_com(chapters, docx_path, timeout=120):
 
 
 def attach_pages(chapters_a, chapters_b, path_a, path_b, soffice_path=None, word_timeout_s=45):
+    toc_info = {"detected": False, "pages_skipped_a": None, "pages_skipped_b": None}
+
     if find_word_com():
-        status_a, ok_a, _, _ = _run_with_timeout(assign_pages_via_word_com, word_timeout_s, chapters_a, path_a)
-        ok_a = bool(ok_a) if status_a == "ok" else False
-        ok_b = False
+        status_a, result_a, _, _ = _run_with_timeout(assign_pages_via_word_com, word_timeout_s, chapters_a, path_a)
+        ok_a, toc_a = (result_a if status_a == "ok" and result_a else (False, False))
+        ok_b, toc_b = False, False
         if ok_a:
-            status_b, ok_b, _, _ = _run_with_timeout(assign_pages_via_word_com, word_timeout_s, chapters_b, path_b)
-            ok_b = bool(ok_b) if status_b == "ok" else False
+            status_b, result_b, _, _ = _run_with_timeout(assign_pages_via_word_com, word_timeout_s, chapters_b, path_b)
+            ok_b, toc_b = (result_b if status_b == "ok" and result_b else (False, False))
         if ok_a and ok_b:
-            return "word_com"
+            toc_info["detected"] = bool(toc_a or toc_b)
+            return "word_com", toc_info
         for ch in chapters_a:
             ch.pop("page", None)
         for ch in chapters_b:
@@ -622,16 +679,19 @@ def attach_pages(chapters_a, chapters_b, path_a, path_b, soffice_path=None, word
     if soffice_path:
         pages_a = render_page_texts(path_a, soffice_path)
         pages_b = render_page_texts(path_b, soffice_path)
-        assign_pages_to_chapters(chapters_a, pages_a)
-        assign_pages_to_chapters(chapters_b, pages_b)
+        skipped_a = assign_pages_to_chapters(chapters_a, pages_a)
+        skipped_b = assign_pages_to_chapters(chapters_b, pages_b)
         if pages_a and pages_b:
-            return "libreoffice"
+            toc_info["detected"] = bool(skipped_a or skipped_b)
+            toc_info["pages_skipped_a"] = skipped_a
+            toc_info["pages_skipped_b"] = skipped_b
+            return "libreoffice", toc_info
 
     for ch in chapters_a:
         ch["page"] = None
     for ch in chapters_b:
         ch["page"] = None
-    return None
+    return None, toc_info
 
 # ---------------------------------------------------------------------------
 # Diff-Logik
@@ -681,6 +741,8 @@ def classify(ch_a, ch_b):
     return "changed", ratio, images_changed
 
 def natural_sort_key(number, order_index):
+    if number.lower() in _TOC_HEADING_TEXTS:
+        return (-1, order_index, ())
     if number.startswith("_"):
         return (1, order_index, ())
     parts = number.split(".")
@@ -688,7 +750,7 @@ def natural_sort_key(number, order_index):
         parsed = tuple(int(p) for p in parts)
     except ValueError:
         return (1, order_index, ())
-    return (0, 0, parsed)
+    return (0, order_index, parsed)
 
 def _similarity(a, b):
     if not a or not b:
@@ -696,8 +758,8 @@ def _similarity(a, b):
     return difflib.SequenceMatcher(None, a, b, autojunk=False).ratio()
 
 def fallback_match_unnumbered(deleted_only, new_only, threshold=0.6, time_budget_s=5.0):
-    candidates_a = [c for c in deleted_only if c["number"].startswith("_")]
-    candidates_b = [c for c in new_only if c["number"].startswith("_")]
+    candidates_a = [c for c in deleted_only if c["number"].startswith("_") or c.get("_source") == "toc_heading"]
+    candidates_b = [c for c in new_only if c["number"].startswith("_") or c.get("_source") == "toc_heading"]
 
     pairs = []
     used_b_keys = set()
@@ -1179,7 +1241,7 @@ def _compute_group_flags(page_seq):
     return first_flags, last_flags
 
 def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None, meta_b=None,
-                 pages_method=None, diagnostics=None, moves=None, moves_complete=True):
+                 pages_method=None, diagnostics=None, moves=None, moves_complete=True, toc_info=None):
     meta_a = meta_a or {"name": name_a, "modified": ""}
     meta_b = meta_b or {"name": name_b, "modified": ""}
     review_options_html = "".join(f'<option value="{v}">{html.escape(label)}</option>' for v, label in REVIEW_STATUS_OPTIONS)
@@ -1255,6 +1317,16 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
         page_note = "📄 Seiten-Gruppierung nicht verfügbar (weder MS Word/COM noch LibreOffice gefunden, oder fehlerhaft)."
     else:
         page_note = ""
+
+    toc_note = ""
+    if toc_info and toc_info.get("detected"):
+        parts = []
+        if toc_info.get("pages_skipped_a"):
+            parts.append(f"Dokument A: {toc_info['pages_skipped_a']} Seite(n)")
+        if toc_info.get("pages_skipped_b"):
+            parts.append(f"Dokument B: {toc_info['pages_skipped_b']} Seite(n)")
+        detail = f" ({', '.join(parts)})" if parts else ""
+        toc_note = f"📚 Verzeichnis am Dokumentanfang erkannt und bei der Seitenzuordnung übersprungen{detail}."
 
     diagnostics_html = ""
     if diagnostics:
@@ -1428,6 +1500,7 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
   <div class="doc-names">Dokument A: <b>{html.escape(name_a)}</b> &nbsp;|&nbsp; Dokument B: <b>{html.escape(name_b)}</b></div>
   <div class="doc-names">ℹ️ {html.escape(linebreak_note)}</div>
   {f'<div class="doc-names">{html.escape(page_note)}</div>' if page_note else ''}
+  {f'<div class="doc-names">{html.escape(toc_note)}</div>' if toc_note else ''}
   {diagnostics_html}
   {moves_summary_html}
   <div class="version-line">Tool-Version {SCRIPT_VERSION} · Review-Schema {REVIEW_SCHEMA_VERSION}</div>
@@ -2089,9 +2162,10 @@ def main():
 
     pages_method = None
     diagnostics = None
+    toc_info = None
     if not args.no_pages:
         diagnostics = diagnose_page_detection(args.soffice_path)
-        method = attach_pages(chapters_a, chapters_b, path_a, path_b, soffice_path=args.soffice_path)
+        method, toc_info = attach_pages(chapters_a, chapters_b, path_a, path_b, soffice_path=args.soffice_path)
         pages_method = method if method is not None else "unavailable"
 
     rows = build_comparison(chapters_a, chapters_b, ignore_linebreaks=ignore_linebreaks)
@@ -2105,6 +2179,7 @@ def main():
         rows, stats, path_a.name, path_b.name, ignore_linebreaks=ignore_linebreaks,
         meta_a=doc_metadata(path_a), meta_b=doc_metadata(path_b),
         pages_method=pages_method, diagnostics=diagnostics, moves=moves, moves_complete=moves_complete,
+        toc_info=toc_info,
     )
     out_path = Path(args.output)
     out_path.write_text(out_html, encoding="utf-8")

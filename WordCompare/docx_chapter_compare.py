@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """
 docx_chapter_compare.py
-Version 3.4 / 2026-09-20 / Grund: COM-Thread-Initialisierung (CoInitialize) für 
-    Firmenrechner (z.B. Office 365 + Cryptshare) hinzugefügt, um Abstürze beim 
-    Hintergrund-Aufruf von MS Word zu verhindern. Zudem saubere Deinitialisierung
-    im finally-Block zur Vermeidung von Speicherlecks.
+Version 3.4 / 2026-09-20 / Grund: COM-Thread-Initialisierung (pythoncom.
+    CoInitialize()/CoUninitialize() pro Thread) für assign_pages_via_word_com()
+    und diagnose_page_detection() ergänzt - COM-Automation aus einem
+    Hintergrund-Thread heraus (die GUI ruft das ueber threading.Thread auf)
+    kann ohne explizite Thread-Initialisierung stillschweigend fehlschlagen
+    oder inkonsistent funktionieren. Praxis-Fix nach Test auf einem
+    Firmenrechner. Zusaetzlich: Documents.Count-Sicherheitscheck (siehe v3.3)
+    jetzt auch in diagnose_page_detection() ergänzt - war dort bisher nicht
+    vorhanden, ein Nachzügler-Fix passend zur selben Absicherung.
 
 Vergleicht zwei Word-Dokumente (.docx) auf Basis von Kapitelnummern als
 Fixpunkten und erzeugt einen eigenstaendigen HTML-Report:
@@ -1937,7 +1942,7 @@ def diagnose_page_detection(soffice_explicit=None):
                 lines.append(f"MS Word/COM: pywin32 ist installiert, aber die Verbindung zu Word schlug fehl: {exc!r}.")
             finally:
                 try:
-                    if word is not None:
+                    if word is not None and word.Documents.Count == 0:
                         word.Quit()
                 except Exception:
                     pass

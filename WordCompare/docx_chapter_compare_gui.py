@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """
 docx_chapter_compare_gui.py
-Version 2.4 / 2026-09-20 / Grund: Splash-Screen (Intro-Bild FirmenLogo.JPG) 
-    eingebaut, das 5 Sekunden lang die Versionsnummern anzeigt, bevor die 
-    eigentliche GUI startet. Wichtiger Fix zur Darstellung von Web-Reports
-    über lokalen HTTP-Server bei eingeschränktem Dateisystemzugriff in 
-    Firmennetzwerken integriert.
+Version 2.4 / 2026-09-20 / Grund: Zwei Ergänzungen aus dem Praxistest in der
+    Firma: (1) Splash-Screen mit Firmenlogo (FirmenLogo.JPG, 5 Sekunden,
+    Pillow-Animation mit Fallback falls Pillow fehlt); (2) Ausgabedateiname
+    wird jetzt automatisch um ".html" ergänzt, falls die Endung beim freien
+    Eintippen ins Textfeld fehlt oder falsch ist (vorher nur über den
+    "Speichern unter…"-Dialog sichergestellt, nicht beim manuellen Eintippen -
+    ein fehlendes ".html" lässt Browser/den lokalen HTTP-Server den
+    Content-Type nicht mehr korrekt erkennen, Bericht erscheint dann nur als
+    Rohtext statt gerendert). Der lokale-HTTP-Server-Mechanismus selbst
+    (siehe v2.3) ist unverändert, keine neue Änderung in dieser Version.
 
 Desktop-GUI (Tkinter, keine Zusatz-Installation noetig) fuer den
 Kapitelvergleich zweier Word-Dokumente. Nutzt dieselbe Vergleichslogik und
@@ -397,6 +402,15 @@ class CompareApp(tk.Tk):
         path_a = Path(self.var_a.get().strip())
         path_b = Path(self.var_b.get().strip())
         out_path = Path(self.var_out.get().strip() or (default_output_dir() / "vergleich.html"))
+        # WICHTIG: Fehlt die Endung (z.B. weil frei ins Textfeld getippt statt
+        # ueber "Speichern unter..." gewaehlt), wird sie hier automatisch
+        # ergaenzt statt stillschweigend eine erweiterungslose Datei zu
+        # erzeugen - eine Datei ohne ".html" wird von manchen Browsern/vom
+        # lokalen HTTP-Server nicht als HTML erkannt (falscher/fehlender
+        # Content-Type) und dann nur als Rohtext angezeigt statt gerendert.
+        if out_path.suffix.lower() != ".html":
+            out_path = out_path.with_name(out_path.name + ".html") if out_path.suffix else out_path.with_suffix(".html")
+            self.var_out.set(str(out_path))
 
         if not self.var_a.get().strip() or not self.var_b.get().strip():
             messagebox.showwarning("Fehlende Angabe", "Bitte beide Dokumente auswählen.")

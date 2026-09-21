@@ -1,15 +1,28 @@
 #!/usr/bin/env python3
 """
 docx_chapter_compare.py
-Version 3.4 / 2026-09-20 / Grund: COM-Thread-Initialisierung (pythoncom.
-    CoInitialize()/CoUninitialize() pro Thread) für assign_pages_via_word_com()
-    und diagnose_page_detection() ergänzt - COM-Automation aus einem
-    Hintergrund-Thread heraus (die GUI ruft das ueber threading.Thread auf)
-    kann ohne explizite Thread-Initialisierung stillschweigend fehlschlagen
-    oder inkonsistent funktionieren. Praxis-Fix nach Test auf einem
-    Firmenrechner. Zusaetzlich: Documents.Count-Sicherheitscheck (siehe v3.3)
-    jetzt auch in diagnose_page_detection() ergänzt - war dort bisher nicht
-    vorhanden, ein Nachzügler-Fix passend zur selben Absicherung.
+Version 3.5 / 2026-09-20 / Grund: Wichtiger Bugfix - Inhaltsverzeichnis,
+    Abbildungs- und Tabellenverzeichnis am Dokumentanfang wurden bisher NICHT
+    von der Kapitel-Erkennung ausgeschlossen. Automatisch generierte Word-
+    Verzeichnisse rendern ihre Eintraege oft im selben "NUMMER<TAB>Text
+    <TAB>Seitenzahl"-Muster wie echte Kapitelanfaenge - wurden dadurch
+    faelschlich als eigene Phantom-Kapitel VOR den echten Kapiteln erkannt
+    (reproduziert mit Testdatei: exakt dieselben Kapitelnummern erschienen
+    doppelt - einmal aus dem Verzeichnis, einmal aus dem echten Inhalt).
+    Das brachte nicht nur die Kapitelliste durcheinander, sondern vor allem
+    die anschliessende Seitenzuordnung (Cursor "verbrauchte" die falschen,
+    zu frueh liegenden ToC-Fundstellen zuerst) - beobachtet als "keine
+    Seitenzahl vor Seite 4" bei einem realen Firmendokument mit ToC+List of
+    Figures+List of Tables vor den eigentlichen Kapiteln. Neue Erkennung:
+    ein "Verzeichnis-Modus" startet bei einer erkannten Verzeichnis-
+    Ueberschrift (Inhaltsverzeichnis/Abbildungsverzeichnis/Tabellen-
+    verzeichnis/Glossar, auch englisch) und endet automatisch entweder bei
+    einer ECHTEN formatvorlagen-numerierten Ueberschrift (starkes Signal:
+    Verzeichniseintraege selbst sind nie so numeriert) oder bei einem
+    ausreichend langen Absatz (>200 Zeichen - Verzeichniseintraege sind
+    immer kurz, echter Fliesstext praktisch nie). Mit Regressionstest
+    gegen alle bisherigen Testdateien verifiziert (keine Aenderung an
+    bekannten Kapitelzahlen).
 
 Vergleicht zwei Word-Dokumente (.docx) auf Basis von Kapitelnummern als
 Fixpunkten und erzeugt einen eigenstaendigen HTML-Report:
@@ -57,7 +70,7 @@ from docx.oxml.ns import qn
 from docx.shared import Pt, RGBColor, Twips
 from lxml import etree
 
-SCRIPT_VERSION = "3.4"
+SCRIPT_VERSION = "3.5"
 REVIEW_SCHEMA_VERSION = "1.0"
 
 REVIEW_STATUS_OPTIONS = [
@@ -265,6 +278,29 @@ def _extract_images(paragraph):
     return images
 
 
+# Ueberschriften-Texte, die typischerweise ein Verzeichnis einleiten
+# (Inhalts-, Abbildungs-, Tabellen-, Abkuerzungsverzeichnis). Automatisch
+# generierte Word-Verzeichnisse rendern ihre Eintraege oft im selben
+# "NUMMER<TAB>Text<TAB>Seitenzahl"-Muster wie echte Kapitelanfaenge (mit
+# Tab-Fuehrungspunkten zur Seitenzahl) - ohne Ausschluss wuerden solche
+# Eintraege faelschlich als eigene (Phantom-)Kapitel erkannt, VOR den
+# tatsaechlichen Kapiteln im Dokument. Das verwirrt sowohl die Kapitelliste
+# selbst als auch - noch gravierender - die anschliessende Seitenzuordnung
+# (der Cursor "verbraucht" die falschen, zu frueh liegenden Fundstellen).
+_TOC_HEADING_TEXTS = {
+    "inhaltsverzeichnis", "table of contents", "contents",
+    "abbildungsverzeichnis", "list of figures",
+    "tabellenverzeichnis", "list of tables",
+    "abkürzungsverzeichnis", "abkuerzungsverzeichnis", "list of abbreviations",
+    "glossar", "glossary",
+}
+# Verzeichniseintraege sind fast immer kurz (nur Titel + Seitenzahl) -
+# echter Fliesstext eines Kapitels ist praktisch immer deutlich laenger.
+# Dient als Ausstiegs-Signal aus dem Verzeichnis-Modus, falls kein Heading-
+# Stil zur Verfuegung steht (siehe unten).
+_TOC_EXIT_TEXT_LEN = 200
+
+
 def extract_chapters(docx_path):
     doc = Document(docx_path)
     num_to_abstract, abstract_levels, style_linked = _load_numbering_definitions(docx_path)
@@ -276,6 +312,7 @@ def extract_chapters(docx_path):
     pending_numbers = []
     fallback_counter = 0
     current_para_idx = -1
+    in_toc_section = False
 
     def new_chapter(number, source="fallback"):
         nonlocal current, fallback_counter
@@ -305,6 +342,23 @@ def extract_chapters(docx_path):
         current_para_idx = para_idx
         text = para.text.strip()
         imgs = _extract_images(para)
+
+        # Verzeichnis-Modus: startet bei einer erkannten Verzeichnis-
+        # Ueberschrift, endet automatisch entweder bei einer ECHTEN
+        # formatvorlagen-numerierten Ueberschrift (starkes Signal fuer
+        # "hier beginnt jetzt ein echtes Kapitel" - Verzeichniseintraege
+        # selbst sind nie formatvorlagen-numeriert) oder bei einem
+        # ausreichend langen Absatz (echter Fliesstext statt kurzer
+        # Verzeichniszeile). Waehrend des Modus wird jeglicher Absatz
+        # komplett ignoriert - weder Nummer-Erkennung noch Text-Anhaengen.
+        if text.strip().lower().rstrip(":") in _TOC_HEADING_TEXTS:
+            in_toc_section = True
+            continue
+        if in_toc_section:
+            auto_number_probe = numberer.number_for_paragraph(para)
+            if auto_number_probe is None and len(text) < _TOC_EXIT_TEXT_LEN:
+                continue  # weiterhin im Verzeichnis-Bereich - Zeile ignorieren
+            in_toc_section = False  # Bereich verlassen, dieser Absatz wird normal verarbeitet
 
         auto_number = numberer.number_for_paragraph(para)
         if auto_number is not None:

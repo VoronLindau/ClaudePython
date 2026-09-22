@@ -1,10 +1,44 @@
 #!/usr/bin/env python3
 """
 docx_chapter_compare.py
-Version 3.11 / 2026-09-22 / Grund: Robuste Seiten-Erkennung für Verzeichnisse (TOC)
-    auf Systemen mit englischem Word, Deckblättern und SDT-Containern. Wenn die 
-    native Word-Suche ("Table of Contents") fehlschlägt, fragt das Skript nun 
-    direkt die Range.Information der Verzeichnis-Objekte ab, um die Seite zu erzwingen.
+Version 3.12 / 2026-09-22 / Grund: Kritischer Bugfix in der von der Firma
+    ergaenzten Verzeichnis-Erkennung (v3.9-3.11, Aenderungshistorie dieser
+    Versionen selbst leider nicht dokumentiert uebernommen worden) - der
+    Absatz, der den Verzeichnis-Modus beendet (erste echte Kapitelueberschrift
+    nach ToC/Abbildungs-/Tabellenverzeichnis), wurde ZWEIMAL durch
+    numberer.number_for_paragraph() geschickt: einmal als Testabfrage ("ist
+    das eine echte Ueberschrift?"), dann nochmal im normalen Verarbeitungspfad.
+    Diese Funktion ist NICHT rein lesend - sie zaehlt bei einem Treffer einen
+    zustandsbehafteten Zaehler hoch. Der doppelte Aufruf verschob dadurch
+    ALLE nachfolgenden echten Kapitelnummern systematisch um 1 (real
+    beobachtet an einem 90-Kapitel-Testdokument: "Scope" erhielt Nummer "2"
+    statt "1", letztes Kapitel "61.2" statt "60.2" - bei ansonsten identischem
+    Dokumentinhalt in A und B blieb der reine A-vs-B-Abgleich zwar intern
+    konsistent, aber JEDE im Bericht angezeigte Kapitelnummer stimmte nicht
+    mehr mit der Realitaet in Word ueberein). Fix: Ergebnis der Testabfrage
+    wird jetzt zwischengespeichert und wiederverwendet statt erneut
+    abgefragt. Mit den echten Testdateien (Scope1_1_/Scope2_1_, 90 Kapitel,
+    Referenz-Seitenzahlen 7->6/27->21/60.2->46) sowie den alten Dateien ohne
+    Verzeichnis vollstaendig regressionsgetestet - keine Abweichung.
+
+    Ausserdem (Klaerung mit dem Anwender): Verzeichnisse (Inhalts-/
+    Abbildungs-/Tabellenverzeichnis) bleiben bewusst als eigenes, sichtbares
+    "Verzeichnis"-Pseudokapitel im Bericht erhalten (Option 1), statt sie wie
+    in der Vorversion 3.5-3.8 komplett zu verwerfen (Option 2 wurde kurz
+    erwogen, dann verworfen) - damit sieht man auch, ob/wie sich das
+    Verzeichnis selbst zwischen den Versionen veraendert hat.
+
+Version 3.9-3.11 / 2026-09-2x / Von der Firma ergaenzt, Einzel-Grund nicht
+    mehr dokumentiert vorliegend - zusammengefasst: (1) _iter_paragraphs_
+    including_sdts() liest jetzt auch Absaetze innerhalb von Word-
+    Content-Controls (SDT) mit, in denen ein automatisch generiertes
+    Inhaltsverzeichnis typischerweise liegt (python-docx's document.
+    paragraphs sieht solche Container sonst gar nicht - Tabellen werden
+    weiterhin bewusst ausgeschlossen); (2) robustere Verzeichnis-Erkennung
+    ueber echte Word-COM-Objekte (doc.TablesOfContents/TablesOfFigures) mit
+    Text-/Punktfuehrer-Mustern als Fallback; (3) je Kapitel wird bei der
+    Seitensuche die laengste der ersten drei Textzeilen als Suchschluessel
+    verwendet statt nur des Anfangs.
 
 Vergleicht zwei Word-Dokumente (.docx) auf Basis von Kapitelnummern als
 Fixpunkten und erzeugt einen eigenstaendigen HTML-Report.
@@ -37,7 +71,7 @@ from docx.shared import Pt, RGBColor, Twips
 from docx.text.paragraph import Paragraph
 from lxml import etree
 
-SCRIPT_VERSION = "3.11"
+SCRIPT_VERSION = "3.12"
 REVIEW_SCHEMA_VERSION = "1.0"
 
 REVIEW_STATUS_OPTIONS = [
@@ -324,10 +358,23 @@ def extract_chapters(docx_path):
             new_chapter(text.strip(), source="toc_heading")
             continue
 
+        # WICHTIG (Bugfix): auto_number_probe wird hier ZWISCHENGESPEICHERT
+        # und weiter unten WIEDERVERWENDET statt erneut abgefragt zu werden.
+        # numberer.number_for_paragraph() ist NICHT rein lesend - sie zaehlt
+        # bei einem Treffer einen internen, zustandsbehafteten Zaehler hoch.
+        # Ohne diesen Cache wuerde der Absatz, der den Verzeichnis-Modus
+        # beendet, ZWEIMAL durch die Funktion laufen (einmal als Testabfrage
+        # hier, einmal im normalen Pfad weiter unten) und den Zaehler zweimal
+        # erhoehen - dadurch verschieben sich ALLE nachfolgenden echten
+        # Kapitelnummern systematisch um 1 (real beobachtet: "Scope" erhielt
+        # Nummer "2" statt "1", letztes Kapitel "61.2" statt "60.2").
+        auto_number_cached = None
+
         if in_toc_section:
             toc_section_para_count += 1
             is_real_heading = False
             auto_number_probe = numberer.number_for_paragraph(para)
+            auto_number_cached = auto_number_probe
             
             if is_toc_line:
                 is_real_heading = False
@@ -354,7 +401,7 @@ def extract_chapters(docx_path):
                 append_images(imgs)
             continue
 
-        auto_number = numberer.number_for_paragraph(para)
+        auto_number = auto_number_cached if auto_number_cached is not None else numberer.number_for_paragraph(para)
         if auto_number is not None:
             pending_numbers.clear()
             new_chapter(auto_number, source="heading_auto")
@@ -495,15 +542,18 @@ def assign_pages_to_chapters(chapters, page_texts, key_len=40):
         return 0
 
     toc_end_page = _detect_toc_end_page(page_texts)
-    
-    # NEU: Startseite des TOC in LibreOffice erkennen, falls vorhanden
+
+    # Startseite des Verzeichnisses ermitteln, damit das sichtbare
+    # "toc_heading"-Pseudokapitel (Option 1: Verzeichnis bleibt als eigenes,
+    # vergleichbares Kapitel im Bericht) eine plausible Seite bekommt, statt
+    # ohne Seitenzahl dazustehen.
     toc_start_page = None
     pattern = re.compile(r"(?:^|[\n])[ \t]*(?:Abbildung|Figure|Table|Tabelle|[\d\.]+)[^\n]{2,200}?(?:\.{4,}|\t|\s{3,})\d+[ \t]*(?=[\n]|$)", re.IGNORECASE)
     for i, text in enumerate(page_texts[:15]):
         if pattern.search(text) or re.search(r"\.{10,}", text):
             toc_start_page = i + 1
             break
-            
+
     page_idx = 0
     cursor = 0
     for ch in chapters:
@@ -517,14 +567,14 @@ def assign_pages_to_chapters(chapters, page_texts, key_len=40):
             if toc_end_page >= 0 and page_idx <= toc_end_page:
                 page_idx = toc_end_page + 1
                 cursor = 0
-                
+
             text_lines = [line.strip() for line in ch.get("text", "").split('\n') if line.strip()]
             best_line = ""
             for line in text_lines[:3]:
                 if len(line) > len(best_line):
                     best_line = line
             key = normalize_whitespace(best_line)[:key_len]
-            
+
         if key:
             while True:
                 if page_idx >= len(page_texts):

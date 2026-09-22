@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
 """
 docx_chapter_compare.py
-Version 3.10 / 2026-09-21 / Grund: Bugfix für Inhalts- und Abbildungsverzeichnisse 
-    in bestimmten Export-Formaten (z.B. DOORS). 1) Das Schlüsselwort "Inhalt" wurde 
-    zu den Erkennungs-Headings hinzugefügt. 2) Intelligenter TOC-Exit: Unterscheidet
-    jetzt bei identischen Texten exakt zwischen Verzeichniseintrag (endet auf Tab + 
-    Seitenzahl) und echter Überschrift (keine Seitenzahl am Ende). 3) Das Inhalts- 
-    und Abbildungsverzeichnis wird nicht mehr gelöscht, sondern als intelligenter, 
-    vergleichbarer Gesamt-Block ("Inhalt") ganz oben in den HTML-Report eingefügt.
+Version 3.11 / 2026-09-22 / Grund: Robuste Seiten-Erkennung für Verzeichnisse (TOC)
+    auf Systemen mit englischem Word, Deckblättern und SDT-Containern. Wenn die 
+    native Word-Suche ("Table of Contents") fehlschlägt, fragt das Skript nun 
+    direkt die Range.Information der Verzeichnis-Objekte ab, um die Seite zu erzwingen.
 
 Vergleicht zwei Word-Dokumente (.docx) auf Basis von Kapitelnummern als
 Fixpunkten und erzeugt einen eigenstaendigen HTML-Report.
@@ -37,9 +34,10 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Pt, RGBColor, Twips
+from docx.text.paragraph import Paragraph
 from lxml import etree
 
-SCRIPT_VERSION = "3.10"
+SCRIPT_VERSION = "3.11"
 REVIEW_SCHEMA_VERSION = "1.0"
 
 REVIEW_STATUS_OPTIONS = [
@@ -247,6 +245,20 @@ def _extract_images(paragraph):
     return images
 
 
+def _iter_paragraphs_including_sdts(doc):
+    paras = []
+    def walk(element):
+        for child in element.iterchildren():
+            if child.tag == qn('w:p'):
+                paras.append(Paragraph(child, doc._body))
+            elif child.tag == qn('w:tbl'):
+                pass
+            else:
+                walk(child)
+    walk(doc.element.body)
+    return paras
+
+
 _TOC_HEADING_TEXTS = {
     "inhaltsverzeichnis", "inhalt", "table of contents", "contents",
     "abbildungsverzeichnis", "list of figures",
@@ -255,8 +267,8 @@ _TOC_HEADING_TEXTS = {
     "glossar", "glossary",
 }
 _TOC_EXIT_TEXT_LEN = 200
-# Sucht am Ende der Zeile nach Punktlinien oder Tabulatoren gefolgt von einer Ziffer (Seitenzahl)
 _TOC_LINE_RE = re.compile(r"(?:\.{5,}|\t)[ \t]*\d+[ \t]*$")
+
 
 def extract_chapters(docx_path):
     doc = Document(docx_path)
@@ -271,7 +283,6 @@ def extract_chapters(docx_path):
     current_para_idx = -1
     in_toc_section = False
     toc_section_para_count = 0
-    _TOC_SECTION_MAX_PARAS = 1500
 
     def new_chapter(number, source="fallback"):
         nonlocal current, fallback_counter
@@ -297,40 +308,51 @@ def extract_chapters(docx_path):
             new_chapter(None)
         current["images"].extend(imgs)
 
-    for para_idx, para in enumerate(doc.paragraphs):
+    for para_idx, para in enumerate(_iter_paragraphs_including_sdts(doc)):
         current_para_idx = para_idx
         text = para.text.strip()
         imgs = _extract_images(para)
 
         text_lower = text.strip().lower().rstrip(":")
-        if text_lower in _TOC_HEADING_TEXTS:
+        is_toc_heading = text_lower in _TOC_HEADING_TEXTS
+        is_toc_line = bool(_TOC_LINE_RE.search(text))
+
+        if is_toc_heading:
             in_toc_section = True
             toc_section_para_count = 0
             pending_numbers.clear()
-            # Das Verzeichnis als separates "Kapitel" anlegen, damit es im Report verglichen wird
             new_chapter(text.strip(), source="toc_heading")
             continue
-            
+
         if in_toc_section:
             toc_section_para_count += 1
             is_real_heading = False
             auto_number_probe = numberer.number_for_paragraph(para)
             
-            # Pürfen, ob der Verzeichnis-Modus verlassen werden soll (weil ein echtes Kapitel beginnt)
-            if auto_number_probe is not None:
-                is_real_heading = True
-            elif ANCHOR_TAB_RE.match(text) or DOT_CONTINUATION_RE.match(text) or BARE_NUMBER_RE.match(text):
-                # Echte Überschrift (hat im Gegensatz zum TOC keinen Tabulator/Zahl am Ende)
-                if not _TOC_LINE_RE.search(text):
+            if is_toc_line:
+                is_real_heading = False
+                toc_section_para_count = 0
+            else:
+                if auto_number_probe is not None:
                     is_real_heading = True
-                    
-            if not is_real_heading and len(text) < _TOC_EXIT_TEXT_LEN and toc_section_para_count < _TOC_SECTION_MAX_PARAS:
+                elif ANCHOR_TAB_RE.match(text) or DOT_CONTINUATION_RE.match(text) or BARE_NUMBER_RE.match(text):
+                    is_real_heading = True
+
+            if not is_real_heading and len(text) < _TOC_EXIT_TEXT_LEN and toc_section_para_count < 20:
                 append_text(text)
                 if imgs:
                     append_images(imgs)
                 continue
             
             in_toc_section = False
+
+        if is_toc_line:
+            if current is None:
+                new_chapter("Verzeichnis", source="toc_heading")
+            append_text(text)
+            if imgs:
+                append_images(imgs)
+            continue
 
         auto_number = numberer.number_for_paragraph(para)
         if auto_number is not None:
@@ -473,14 +495,25 @@ def assign_pages_to_chapters(chapters, page_texts, key_len=40):
         return 0
 
     toc_end_page = _detect_toc_end_page(page_texts)
+    
+    # NEU: Startseite des TOC in LibreOffice erkennen, falls vorhanden
+    toc_start_page = None
+    pattern = re.compile(r"(?:^|[\n])[ \t]*(?:Abbildung|Figure|Table|Tabelle|[\d\.]+)[^\n]{2,200}?(?:\.{4,}|\t|\s{3,})\d+[ \t]*(?=[\n]|$)", re.IGNORECASE)
+    for i, text in enumerate(page_texts[:15]):
+        if pattern.search(text) or re.search(r"\.{10,}", text):
+            toc_start_page = i + 1
+            break
+            
     page_idx = 0
     cursor = 0
     for ch in chapters:
         is_toc = ch.get("_source") == "toc_heading"
         if is_toc:
+            if toc_start_page:
+                ch["page"] = toc_start_page
+                continue
             key = ch["number"][:key_len]
         else:
-            # Reelle Kapitel springen zur Sicherheit IMMER über das Inhaltsverzeichnis
             if toc_end_page >= 0 and page_idx <= toc_end_page:
                 page_idx = toc_end_page + 1
                 cursor = 0
@@ -505,6 +538,7 @@ def assign_pages_to_chapters(chapters, page_texts, key_len=40):
         ch["page"] = page_idx + 1 if page_idx < len(page_texts) else None
     return toc_end_page + 1 if toc_end_page >= 0 else 0
 
+
 def find_word_com():
     if sys.platform != "win32":
         return False
@@ -513,6 +547,7 @@ def find_word_com():
         return True
     except ImportError:
         return False
+
 
 def assign_pages_via_word_com(chapters, docx_path, timeout=120):
     if sys.platform != "win32":
@@ -562,21 +597,32 @@ def assign_pages_via_word_com(chapters, docx_path, timeout=120):
         cursor_start = 0
         found_count = 0
 
-        # Verzeichnisse per nativer Word-Funktion überspringen
+        # Robuste Verzeichnis-Seiten Ermittlung (direkt über Word-Objekte)
         toc_cursor_jump = 0
+        toc_start_pages = []
         try:
             for toc in doc.TablesOfContents:
                 if toc.Range.End > toc_cursor_jump:
                     toc_cursor_jump = toc.Range.End
                     toc_detected = True
+                try:
+                    p = toc.Range.Characters(1).Information(WD_ACTIVE_END_PAGE_NUMBER)
+                    if p: toc_start_pages.append(p)
+                except Exception:
+                    pass
             for tof in doc.TablesOfFigures:
                 if tof.Range.End > toc_cursor_jump:
                     toc_cursor_jump = tof.Range.End
                     toc_detected = True
+                try:
+                    p = tof.Range.Characters(1).Information(WD_ACTIVE_END_PAGE_NUMBER)
+                    if p: toc_start_pages.append(p)
+                except Exception:
+                    pass
         except Exception:
             pass
 
-        # Fallback für rein textbasierte Verzeichnisse (z.B. DOORS-Exporte)
+        # Fallback für rein textbasierte Verzeichnisse (DOORS, etc.)
         try:
             probe_text = doc.Content.Text[:30000]
             pattern = re.compile(r"(?:^|[\r\n])[ \t]*(?:Abbildung|Figure|Table|Tabelle|[\d\.]+)[^\r\n]{2,200}?(?:\.{5,}|\t)[ \t]*\d+[ \t]*(?=[\r\n]|$)", re.IGNORECASE)
@@ -586,6 +632,12 @@ def assign_pages_via_word_com(chapters, docx_path, timeout=120):
                 if last_end > toc_cursor_jump:
                     toc_cursor_jump = last_end
                     toc_detected = True
+                try:
+                    first_start = toc_matches[0].start()
+                    p = doc.Range(first_start, first_start).Information(WD_ACTIVE_END_PAGE_NUMBER)
+                    if p: toc_start_pages.append(p)
+                except Exception:
+                    pass
                     
             dot_matches = list(re.finditer(r"\.{10,}", probe_text))
             if len(dot_matches) >= 3:
@@ -593,19 +645,26 @@ def assign_pages_via_word_com(chapters, docx_path, timeout=120):
                 if last_dot_end > toc_cursor_jump:
                     toc_cursor_jump = last_dot_end
                     toc_detected = True
+                try:
+                    first_start = dot_matches[0].start()
+                    p = doc.Range(first_start, first_start).Information(WD_ACTIVE_END_PAGE_NUMBER)
+                    if p: toc_start_pages.append(p)
+                except Exception:
+                    pass
         except Exception:
             pass
+
+        toc_start_pages = sorted(list(set(toc_start_pages)))
+        first_toc_page = toc_start_pages[0] if toc_start_pages else None
 
         for ch in chapters:
             is_toc = ch.get("_source") == "toc_heading"
             if is_toc:
                 key = ch["number"][:FIND_KEY_LEN]
             else:
-                # Echte Kapitel springen immer erst NACH das Inhaltsverzeichnis
                 if cursor_start < toc_cursor_jump:
                     cursor_start = toc_cursor_jump
                 
-                # Zeilenumbrüche sauber handhaben (fixt "ASasdA Asd saD" Absturz)
                 text_lines = [line.strip() for line in ch.get("text", "").split('\n') if line.strip()]
                 best_line = ""
                 for line in text_lines[:3]:
@@ -614,8 +673,12 @@ def assign_pages_via_word_com(chapters, docx_path, timeout=120):
                 key = normalize_whitespace(best_line)[:FIND_KEY_LEN]
 
             if not key or cursor_start >= doc_end:
-                ch["page"] = None
+                if is_toc and first_toc_page:
+                    ch["page"] = first_toc_page
+                else:
+                    ch["page"] = None
                 continue
+                
             try:
                 rng = doc.Range(cursor_start, doc_end)
                 f = rng.Find
@@ -627,14 +690,24 @@ def assign_pages_via_word_com(chapters, docx_path, timeout=120):
                 f.MatchWholeWord = False
                 f.MatchWildcards = False
                 found = f.Execute()
+                
                 if found:
                     ch["page"] = rng.Information(WD_ACTIVE_END_PAGE_NUMBER)
                     cursor_start = rng.End
                     found_count += 1
                 else:
-                    ch["page"] = None
+                    # Genialer Fallback: Wenn Word das Verzeichnis nicht als Text findet,
+                    # greifen wir hart auf die zuvor nativ erkannte Verzeichnisseite zurück!
+                    if is_toc and first_toc_page:
+                        ch["page"] = first_toc_page
+                        found_count += 1
+                    else:
+                        ch["page"] = None
             except Exception:
-                ch["page"] = None
+                if is_toc and first_toc_page:
+                    ch["page"] = first_toc_page
+                else:
+                    ch["page"] = None
 
         return found_count > 0, toc_detected
     except Exception:
@@ -741,7 +814,7 @@ def classify(ch_a, ch_b):
     return "changed", ratio, images_changed
 
 def natural_sort_key(number, order_index):
-    if number.lower() in _TOC_HEADING_TEXTS:
+    if number.lower() in _TOC_HEADING_TEXTS or number == "Verzeichnis":
         return (-1, order_index, ())
     if number.startswith("_"):
         return (1, order_index, ())
@@ -1326,7 +1399,7 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
         if toc_info.get("pages_skipped_b"):
             parts.append(f"Dokument B: {toc_info['pages_skipped_b']} Seite(n)")
         detail = f" ({', '.join(parts)})" if parts else ""
-        toc_note = f"📚 Verzeichnis am Dokumentanfang erkannt und bei der Seitenzuordnung übersprungen{detail}."
+        toc_note = f"📚 Verzeichnis am Dokumentanfang erkannt und im Report gebündelt{detail}."
 
     diagnostics_html = ""
     if diagnostics:

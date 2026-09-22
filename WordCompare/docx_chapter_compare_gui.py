@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 docx_chapter_compare_gui.py
-Version 2.6 / 2026-09-21 / Grund: Update passend zu docx_chapter_compare.py Version 3.9
+Version 2.8 / 2026-09-22 / Grund: Update passend zu docx_chapter_compare.py Version 3.11
 """
 
 import json
@@ -14,7 +14,7 @@ import webbrowser
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-GUI_VERSION = "2.6"
+GUI_VERSION = "2.8"
 
 try:
     import docx_chapter_compare as _core
@@ -376,7 +376,7 @@ class CompareApp(tk.Tk):
         path_a = Path(self.var_a.get().strip())
         path_b = Path(self.var_b.get().strip())
         out_path = Path(self.var_out.get().strip() or (default_output_dir() / "vergleich.html"))
-
+        
         if out_path.suffix.lower() != ".html":
             out_path = out_path.with_name(out_path.name + ".html") if out_path.suffix else out_path.with_suffix(".html")
             self.var_out.set(str(out_path))

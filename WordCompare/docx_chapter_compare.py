@@ -1513,6 +1513,18 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
     script_version_json = json.dumps(SCRIPT_VERSION)
     review_schema_json = json.dumps(REVIEW_SCHEMA_VERSION)
     chapter_keys_json = json.dumps({r["key"]: r["number"] for r in rows}, ensure_ascii=False)
+    # WICHTIG: Zusaetzlich als ECHTES Array in Dokumentreihenfolge - ein
+    # JS-Objekt sortiert Schluessel, die wie Ganzzahlen aussehen ("1", "5",
+    # "45"), IMMER zuerst und numerisch aufsteigend, unabhaengig von der
+    # Einfuegereihenfolge (ECMAScript-Spezifikation fuer "integer-like"
+    # Property-Keys). Nicht-ganzzahlige Schluessel wie "5.1", "5.4" (mit
+    # Punkt) landen dadurch bei Object.keys(CHAPTER_KEYS) IMMER ganz hinten -
+    # bei vielen Top-Level-Kapiteln (z.B. 60+) wurden Unterkapitel wie "5.4"
+    # dadurch vom 40er-Anzeigelimit der Verknuepfungs-Vorschlagsliste
+    # abgeschnitten, obwohl die Daten vollstaendig vorhanden waren. Arrays
+    # sind von dieser Sonderregel nicht betroffen, deshalb hier zusaetzlich
+    # als Array in der tatsaechlichen Kapitel-Reihenfolge bereitgestellt.
+    chapter_list_json = json.dumps([{"key": r["key"], "number": r["number"]} for r in rows], ensure_ascii=False)
     safe_id_to_key_json = json.dumps({_safe_id(r["key"]): r["key"] for r in rows}, ensure_ascii=False)
     row_texts_json = json.dumps(
         {r["key"]: {"a": r.get("text_a_raw") or "", "b": r.get("text_b_raw") or ""} for r in rows},
@@ -1692,6 +1704,7 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
   const REVIEW_SCHEMA_VERSION = {review_schema_json};
   const REVIEW_STATUS_VALUES = ['accepted', 'not_accepted', 'refinement_customer', 'internal_clarification'];
   const CHAPTER_KEYS = {chapter_keys_json};
+  const CHAPTER_LIST = {chapter_list_json};  // gleiche Daten, aber als Array - garantiert Dokumentreihenfolge (siehe Kommentar bei chapter_list_json)
   const SAFE_ID_TO_KEY = {safe_id_to_key_json};
   const ROW_TEXTS = {row_texts_json};
   const KEY_TO_SAFE_ID = Object.fromEntries(Object.entries(SAFE_ID_TO_KEY).map(function(e) {{ return [e[1], e[0]]; }}));
@@ -1905,13 +1918,16 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
     const ownKey = SAFE_ID_TO_KEY[id];
     const query = input.value.trim().toLowerCase();
 
-    const allEntries = Object.keys(CHAPTER_KEYS)
-      .filter(function(k) {{ return k !== ownKey; }})
-      .map(function(k) {{ return {{key: k, number: CHAPTER_KEYS[k]}}; }});
-    const matches = (query
-      ? allEntries.filter(function(e) {{ return e.number.toLowerCase().indexOf(query) !== -1; }})
-      : allEntries
-    ).slice(0, ML_MAX_SUGGESTIONS);
+    const allEntries = CHAPTER_LIST.filter(function(e) {{ return e.key !== ownKey; }});
+    // Bei leerem Suchfeld (nur fokussiert, noch nichts eingetippt) ALLE
+    // Kapitel zeigen statt nur die ersten N - der Scroll-Container faengt
+    // auch lange Listen ab, und ein verstecktes Kapitel beim blossen
+    // Fokussieren waere irrefuehrend. Das Anzeige-Limit greift nur bei
+    // einer aktiven, sehr allgemein gehaltenen Suche (z.B. nur "1"
+    // eingetippt), um die Liste dort nicht ausufern zu lassen.
+    const matches = query
+      ? allEntries.filter(function(e) {{ return e.number.toLowerCase().indexOf(query) !== -1; }}).slice(0, ML_MAX_SUGGESTIONS)
+      : allEntries;
 
     if (matches.length === 0) {{
       box.innerHTML = '<div class="ml-suggestion-empty">Kein passendes Kapitel gefunden</div>';

@@ -1,7 +1,47 @@
 #!/usr/bin/env python3
 """
 docx_chapter_compare.py
-Version 3.13 / 2026-09-23 / Grund: Bugfix - "Manuell verknuepfen mit:"-Feld
+Version 3.15 / 2026-09-29 / Grund: Bugfix - der Wort-Diff bei manueller
+    Kapitel-Verknuepfung zeigte bei bestimmten Verlinkungsrichtungen alte und
+    neue Fassung INVERTIERT an (neuer Text faelschlich rot als "entfernt",
+    alter Text faelschlich gruen als "hinzugefuegt", obwohl inhaltlich alles
+    stimmte - bei stark unterschiedlichem Text wirkte dadurch fast der
+    komplette Text durchgestrichen). Ursache: updateLinkDiff() nahm bisher
+    IMMER die A-Seite der eigenen Zeile als "alt" und die B-Seite der
+    Zielzeile als "neu" an - das stimmt nur, wenn man vom GELOESCHTEN
+    (alten) Kapitel aus verlinkt. Verlinkt man stattdessen vom NEUEN Kapitel
+    aus zurueck zum alten (naheliegend, wenn man die Verschiebung beim neuen
+    Kapitel bemerkt), waren die Rollen vertauscht. Fix: "alt" und "neu"
+    werden jetzt anhand der TATSAECHLICH vorhandenen Seite (Text nur in A
+    bzw. nur in B) bestimmt, unabhaengig davon, auf welcher der beiden
+    Zeilen das Eingabefeld sitzt. Mit einem gezielten Testfall (aehnlicher,
+    aber nicht identischer Text in Kapitel 5.1.3/5.1.4) verifiziert: beide
+    Verlinkungsrichtungen liefern jetzt exakt dasselbe, korrekte Ergebnis.
+
+Version 3.14 / 2026-09-29 / Grund: Bugfix - im neuen Such-Dropdown aus v3.13
+    fehlten Unterkapitel wie "5.4" in der Vorschlagsliste, sobald das
+    Dokument viele Top-Level-Kapitel hatte (real beobachtet: Liste brach bei
+    einem 60-Kapitel-Dokument komplett auf ganzzahlige Kapitel um, "5.4" war
+    nicht mehr zu finden). Ursache: die Dropdown-Logik nutzte Object.keys()
+    auf einem JS-Objekt - die ECMAScript-Spezifikation sortiert dabei
+    Schluessel, die wie Ganzzahlen aussehen ("1", "5", "45"), IMMER ZUERST
+    und numerisch aufsteigend, UNABHAENGIG von der urspruenglichen
+    Reihenfolge. Nicht-ganzzahlige Schluessel wie "5.1"/"5.4" (mit Punkt)
+    landen dadurch bei Object.keys() immer ganz hinten und wurden vom
+    40er-Anzeigelimit abgeschnitten - mit einem Node-Snippet direkt bestaetigt
+    (Object.keys({{'5.1':..,'1':..}}) liefert ['1','5.1'], nicht
+    Einfuegereihenfolge). Fix: neue, zusaetzliche JS-Konstante CHAPTER_LIST
+    (echtes Array statt Objekt, ein Array behaelt die tatsaechliche
+    Dokumentreihenfolge bei - diese ECMAScript-Sonderregel gilt nur fuer
+    Objekt-Properties) - das Dropdown baut seine Vorschlaege jetzt daraus.
+    Ausserdem: bei leerem Suchfeld (nur fokussiert) werden jetzt ALLE
+    Kapitel gezeigt statt nur die ersten 40 - das Limit greift nur noch bei
+    einer aktiven, generischen Texteingabe. Mit einem realistischen Testfall
+    (60 Ganzzahl-Kapitel + neues Unterkapitel 5.4) verifiziert: bei leerem
+    Feld erscheinen jetzt alle 63 Kapitel inkl. "5.4", gezielte Eingabe
+    "5.4" findet korrekt genau dieses eine Kapitel.
+
+Version 3.13 / 2026-09-29 / Grund: Bugfix - "Manuell verknuepfen mit:"-Feld
     nutzte bisher eine native HTML5-<datalist> fuer die Autovervollstaendigung.
     Nutzer berichtete: bei Dokumenten mit vielen Kapiteln wurde ein Kapitel,
     das nur im JEWEILS ANDEREN Dokument existiert (klassischer "neu"/
@@ -90,7 +130,7 @@ from docx.shared import Pt, RGBColor, Twips
 from docx.text.paragraph import Paragraph
 from lxml import etree
 
-SCRIPT_VERSION = "3.13"
+SCRIPT_VERSION = "3.15"
 REVIEW_SCHEMA_VERSION = "1.0"
 
 REVIEW_STATUS_OPTIONS = [
@@ -1866,9 +1906,32 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
       diffBox.innerHTML = '';
       return;
     }}
-    const ownText = ROW_TEXTS[ownKey].a || ROW_TEXTS[ownKey].b || '';
-    const targetText = ROW_TEXTS[targetKey].b || ROW_TEXTS[targetKey].a || '';
-    const [leftHtml, rightHtml, wasCompared] = wordDiffHtml(ownText, targetText);
+    // WICHTIG (Bugfix): "alt" und "neu" werden anhand der TATSAECHLICH
+    // vorhandenen Seite bestimmt, NICHT anhand davon, auf welcher der
+    // beiden Zeilen das Eingabefeld gerade sitzt. Vorher wurde immer die
+    // A-Seite der eigenen Zeile als "alt" und die B-Seite der Zielzeile als
+    // "neu" angenommen - verlinkte man aber vom NEUEN Kapitel (nur B-Text)
+    // zurueck zu einem ALTEN, geloeschten Kapitel (nur A-Text), vertauschte
+    // das die Rollen: der neue Text erschien faelschlich als "entfernt"
+    // (rot), der alte als "hinzugefuegt" (gruen) - fast der komplette Text
+    // wirkte dadurch invertiert markiert, obwohl inhaltlich alles stimmte.
+    const ownEntry = ROW_TEXTS[ownKey], targetEntry = ROW_TEXTS[targetKey];
+    const ownHasOnlyA = ownEntry.a && !ownEntry.b;
+    const ownHasOnlyB = ownEntry.b && !ownEntry.a;
+    const targetHasOnlyA = targetEntry.a && !targetEntry.b;
+    const targetHasOnlyB = targetEntry.b && !targetEntry.a;
+    let oldText, newText;
+    if (ownHasOnlyA && targetHasOnlyB) {{
+      oldText = ownEntry.a; newText = targetEntry.b;
+    }} else if (ownHasOnlyB && targetHasOnlyA) {{
+      oldText = targetEntry.a; newText = ownEntry.b;
+    }} else {{
+      // Sonderfall (z.B. beide Seiten "geaendert" statt geloescht/neu) -
+      // wie bisher: eigene Zeile bevorzugt als Ausgangspunkt.
+      oldText = ownEntry.a || ownEntry.b || '';
+      newText = targetEntry.b || targetEntry.a || '';
+    }}
+    const [leftHtml, rightHtml, wasCompared] = wordDiffHtml(oldText, newText);
     const targetNumber = CHAPTER_KEYS[targetKey] || targetKey;
     diffBox.innerHTML =
       '<div class="ld-label">' + (wasCompared ? 'Unterschied' : 'Vergleich (Text zu lang)') +

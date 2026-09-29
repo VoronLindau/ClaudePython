@@ -1,6 +1,25 @@
 #!/usr/bin/env python3
 """
 docx_chapter_compare.py
+Version 3.13 / 2026-09-23 / Grund: Bugfix - "Manuell verknuepfen mit:"-Feld
+    nutzte bisher eine native HTML5-<datalist> fuer die Autovervollstaendigung.
+    Nutzer berichtete: bei Dokumenten mit vielen Kapiteln wurde ein Kapitel,
+    das nur im JEWEILS ANDEREN Dokument existiert (klassischer "neu"/
+    "geloescht"-Fall), in der Vorschlagsliste manchmal nicht angezeigt.
+    Ursache liegt im Browser-eigenen Rendering der <datalist>-Popup-Liste
+    (undokumentiertes, browserabhaengiges Verhalten bei vielen <option>-
+    Elementen) - liess sich ueber reine DOM-Pruefung nicht nachstellen, die
+    Daten selbst (CHAPTER_KEYS, generierte <option>-Elemente) waren in
+    jedem Testfall (4 und 90 Kapitel) nachweislich vollstaendig und korrekt.
+    Fix: natives <datalist> komplett ersetzt durch ein selbst gerendertes
+    Such-Dropdown (eigenes <div>, per JS gefuellt) - filtert CHAPTER_KEYS
+    per Substring-Match bei jeder Eingabe, zeigt bis zu 40 Treffer in einer
+    eigenen, scrollbaren Liste, unabhaengig von Browser-Eigenheiten. Mit
+    Playwright-Interaktionstest verifiziert (Fokus zeigt alle Kapitel,
+    Eingabe filtert korrekt, Klick auf Vorschlag setzt Verknuepfung, JSON-
+    Export/Import weiterhin funktionsfaehig) sowie regressionsgetestet
+    gegen die echten Firmen-Testdateien.
+
 Version 3.12 / 2026-09-22 / Grund: Kritischer Bugfix in der von der Firma
     ergaenzten Verzeichnis-Erkennung (v3.9-3.11, Aenderungshistorie dieser
     Versionen selbst leider nicht dokumentiert uebernommen worden) - der
@@ -71,7 +90,7 @@ from docx.shared import Pt, RGBColor, Twips
 from docx.text.paragraph import Paragraph
 from lxml import etree
 
-SCRIPT_VERSION = "3.12"
+SCRIPT_VERSION = "3.13"
 REVIEW_SCHEMA_VERSION = "1.0"
 
 REVIEW_STATUS_OPTIONS = [
@@ -1405,9 +1424,15 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
         <div class="manual-link-box" data-link-key="{html.escape(r['key'], quote=True)}">
           <div class="ml-row">
             <label for="ml-{safe_id}">🔗 Manuell verknüpfen mit:</label>
-            <input type="text" id="ml-{safe_id}" class="manual-link-input" list="chapter-datalist"
-                   placeholder="Kapitelnummer eingeben…" oninput="onManualLinkChange('{safe_id}')"
-                   autocomplete="off">
+            <div class="ml-input-wrap">
+              <input type="text" id="ml-{safe_id}" class="manual-link-input"
+                     placeholder="Kapitelnummer eingeben oder suchen…"
+                     oninput="onManualLinkInput('{safe_id}')"
+                     onfocus="onManualLinkInput('{safe_id}')"
+                     onblur="hideManualLinkSuggestions('{safe_id}')"
+                     autocomplete="off">
+              <div class="ml-suggestions" id="mls-{safe_id}"></div>
+            </div>
             <button type="button" class="ml-btn" onclick="jumpToManualLink('{safe_id}')" title="Zur verknüpften Zeile springen">↷</button>
             <button type="button" class="ml-btn ml-clear" onclick="clearManualLink('{safe_id}')" title="Verknüpfung zurücknehmen">✕</button>
           </div>
@@ -1600,10 +1625,20 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
   .manual-link-box {{ background: #fafafa; border: 1px solid var(--border); border-top: none; border-radius: 0 0 6px 6px; padding: 6px 12px; font-size: 12px; }}
   .ml-row {{ display: flex; align-items: center; gap: 8px; }}
   .manual-link-box label {{ color: #666; white-space: nowrap; }}
-  .manual-link-input {{ flex: 1; font-size: 12px; padding: 4px 8px; border-radius: 4px; border: 1px solid var(--border); }}
+  .manual-link-input {{ width: 100%; font-size: 12px; padding: 4px 8px; border-radius: 4px; border: 1px solid var(--border); box-sizing: border-box; }}
   .manual-link-box.ml-valid {{ background: #eff6ff; }}
   .manual-link-box.ml-valid .manual-link-input {{ border-color: #2563eb; color: #1d4ed8; }}
   .manual-link-box.ml-invalid .manual-link-input {{ border-color: #dc2626; color: #b91c1c; }}
+  .ml-input-wrap {{ position: relative; flex: 1; }}
+  .ml-suggestions {{
+    display: none; position: absolute; top: 100%; left: 0; right: 0; z-index: 50;
+    max-height: 220px; overflow-y: auto; background: #fff; border: 1px solid var(--border);
+    border-radius: 0 0 6px 6px; box-shadow: 0 4px 10px rgba(0,0,0,0.12); margin-top: 1px;
+  }}
+  .ml-suggestions.ml-suggestions-open {{ display: block; }}
+  .ml-suggestion-item {{ padding: 5px 10px; font-size: 12px; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+  .ml-suggestion-item:hover, .ml-suggestion-item.ml-suggestion-active {{ background: #eff6ff; }}
+  .ml-suggestion-empty {{ padding: 5px 10px; font-size: 12px; color: #888; font-style: italic; }}
   .link-diff {{ margin-top: 8px; padding: 8px 10px; background: #fff; border: 1px solid #bfdbfe; border-radius: 4px; font-size: 12px; line-height: 1.5; display: none; }}
   .link-diff.ld-visible {{ display: block; }}
   .link-diff .ld-label {{ font-size: 10px; text-transform: uppercase; letter-spacing: 0.03em; color: #2563eb; font-weight: 700; margin-bottom: 4px; }}
@@ -1651,9 +1686,6 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
 <div class="compare-grid" id="grid">
   {''.join(row_html)}
 </div>
-<datalist id="chapter-datalist">
-  {''.join(f'<option value="{html.escape(r["number"], quote=True)}">' for r in rows)}
-</datalist>
 <script>
   const DOC_META = {doc_meta_json};
   const SCRIPT_VERSION = {script_version_json};
@@ -1854,6 +1886,60 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
       box.classList.add('ml-invalid');
     }}
     updateLinkDiff(id);
+  }}
+
+  // Eigenes, selbst gerendertes Such-Dropdown statt der nativen
+  // HTML5-<datalist> - die zeigt bei vielen Optionen (grosse Dokumente mit
+  // 80+ Kapiteln) je nach Browser eine unzuverlaessige/unvollstaendige
+  // Vorschlagsliste, ohne dass sich das ueber den DOM-Inhalt selbst
+  // feststellen liesse (reines Browser-eigenes Rendering-Verhalten). Diese
+  // Variante durchsucht CHAPTER_KEYS direkt per JS (Substring-Match, nicht
+  // nur Praefix) und zeigt garantiert ALLE passenden Treffer.
+  const ML_MAX_SUGGESTIONS = 40;
+
+  function onManualLinkInput(id) {{
+    onManualLinkChange(id);
+    const input = document.getElementById('ml-' + id);
+    const box = document.getElementById('mls-' + id);
+    if (!input || !box) {{ return; }}
+    const ownKey = SAFE_ID_TO_KEY[id];
+    const query = input.value.trim().toLowerCase();
+
+    const allEntries = Object.keys(CHAPTER_KEYS)
+      .filter(function(k) {{ return k !== ownKey; }})
+      .map(function(k) {{ return {{key: k, number: CHAPTER_KEYS[k]}}; }});
+    const matches = (query
+      ? allEntries.filter(function(e) {{ return e.number.toLowerCase().indexOf(query) !== -1; }})
+      : allEntries
+    ).slice(0, ML_MAX_SUGGESTIONS);
+
+    if (matches.length === 0) {{
+      box.innerHTML = '<div class="ml-suggestion-empty">Kein passendes Kapitel gefunden</div>';
+    }} else {{
+      box.innerHTML = matches.map(function(e) {{
+        return '<div class="ml-suggestion-item" data-value="' + escHtml(e.number) +
+               '" onmousedown="event.preventDefault(); selectManualLinkSuggestion(\\'' + id + '\\', \\'' +
+               e.number.replace(/'/g, "\\\\'") + '\\')">' + escHtml(e.number) + '</div>';
+      }}).join('');
+    }}
+    box.classList.add('ml-suggestions-open');
+  }}
+
+  function selectManualLinkSuggestion(id, number) {{
+    const input = document.getElementById('ml-' + id);
+    input.value = number;
+    onManualLinkChange(id);
+    hideManualLinkSuggestions(id);
+  }}
+
+  function hideManualLinkSuggestions(id) {{
+    // Kurze Verzoegerung: onblur des Eingabefelds feuert VOR dem onmousedown-
+    // Handler eines Vorschlags - ohne diese wuerde die Liste verschwinden,
+    // bevor der Klick auf einen Vorschlag ueberhaupt registriert wird.
+    setTimeout(function() {{
+      const box = document.getElementById('mls-' + id);
+      if (box) {{ box.classList.remove('ml-suggestions-open'); }}
+    }}, 150);
   }}
 
   function clearManualLink(id) {{

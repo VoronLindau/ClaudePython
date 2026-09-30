@@ -1,6 +1,41 @@
 #!/usr/bin/env python3
 """
 docx_chapter_compare.py
+Version 3.19 / 2026-09-30 / Grund: Wichtige Ergaenzung auf Nutzer-Feedback -
+    eine manuelle (oder automatisch vorgeschlagene) Verknuepfung wirkte sich
+    bisher NUR in der separaten Diff-Box unter dem Eingabefeld aus. Die
+    eigentliche Vergleichszeile selbst zeigte weiterhin stur "kein Kapitel X
+    in diesem Dokument" auf der jeweils leeren Seite - der verknuepfte
+    Inhalt tauchte dort gar nicht auf, obwohl die Verknuepfung im
+    Datenmodell (MANUAL_LINKS) laengst aktiv war. Neue Funktion
+    updateLinkedCellDisplay()/fillCellsFromLink(): sobald eine Verknuepfung
+    (Vorschlag ODER manuell) aktiv ist, wird die leere Seite direkt mit dem
+    bereits im Bericht vorhandenen Inhalt der verknuepften Zeile befuellt
+    (per cloneNode - keine zusaetzlichen Daten noetig) und deutlich als
+    "🔗 via Verknüpfung" markiert (gestrichelter blauer Rahmen), damit es
+    nicht mit einem echten Dokument-Treffer verwechselt wird. WICHTIG:
+    wirkt symmetrisch auf BEIDEN verknuepften Zeilen (nicht nur der, wo das
+    Eingabefeld ausgefuellt wurde) - MANUAL_LINKS speichert die Verknuepfung
+    zwar nur einseitig, die Anzeige wird aber auf die Zielzeile gespiegelt,
+    ohne dort selbst einen MANUAL_LINKS-Eintrag zu setzen. Wird die
+    Verknuepfung entfernt, setzt sich die Zelle ueber ein zwischengespeichertes
+    Original-HTML (ORIGINAL_EMPTY_CELLS) exakt auf den Ursprungszustand
+    zurueck - auch auf der Gegenseite. Mit Playwright vollstaendig getestet
+    (Laden mit Vorschlag, Ruecknahme, beide Richtungen) sowie gegen ein
+    91-Kapitel-Dokument auf Laufzeitfehler und doppelte IDs geprueft -
+    beides unauffaellig.
+
+Version 3.18 / 2026-09-30 / Grund: Fehlenden expliziten Bestaetigen-Button
+    fuer automatische Verschiebungs-Vorschlaege (siehe v3.16) ergaenzt -
+    bisher musste man den vorgeschlagenen Wert entweder neu eintippen (auch
+    wenn er schon korrekt war) oder gar nichts tun (stillschweigende
+    Uebernahme erst beim Export). Neuer Button "✓ Übernehmen" direkt neben
+    dem Verknuepfungsfeld, nur sichtbar solange die Zeile im Vorschlags-
+    Zustand ist (per CSS an .ml-suggested gekoppelt) - bestaetigt den Wert
+    UNVERAENDERT und wechselt den Zustand sauber zu "vom Nutzer bestaetigt".
+    Mit Playwright-Test verifiziert: Button erscheint nur bei Vorschlaegen,
+    verschwindet nach Bestaetigung, Wert bleibt dabei unangetastet.
+
 Version 3.17 / 2026-09-30 / Grund: extract_chapters() bekommt einen neuen
     Parameter allow_heading_typed_number (Standard: True), der die in v3.16
     ergaenzte Erkennung von Kapitelnummern aus reinem Ueberschriftentext
@@ -177,7 +212,7 @@ from docx.shared import Pt, RGBColor, Twips
 from docx.text.paragraph import Paragraph
 from lxml import etree
 
-SCRIPT_VERSION = "3.17"
+SCRIPT_VERSION = "3.19"
 REVIEW_SCHEMA_VERSION = "1.0"
 
 REVIEW_STATUS_OPTIONS = [
@@ -1473,21 +1508,28 @@ def _moves_html(moves_list):
         parts.append(f'<div class="move-note">🔀 {verb} Kapitel {html.escape(m["other_number"])} ({pct}% ähnlich) {arrow}</div>')
     return "".join(parts)
 
-def _cell(number, title, body_html, images, side, status, page=None, first_in_group=False, last_in_group=False, moves=None):
+def _cell(number, title, body_html, images, side, status, page=None, first_in_group=False, last_in_group=False, moves=None, safe_id=None):
     page_class = _page_classes(page, first_in_group, last_in_group)
     page_tag = f'<div class="page-tag">📄 Seite {page}</div>' if (page is not None and first_in_group) else ""
+    cell_id = f' id="cell-{side}-{safe_id}"' if safe_id else ""
 
     if body_html is None:
+        # data-empty-hint speichert den Original-Platzhaltertext, damit JS die
+        # Zelle bei einer manuellen Verknuepfung durch den verlinkten Inhalt
+        # ersetzen und beim Zuruecknehmen der Verknuepfung wieder exakt
+        # herstellen kann (siehe updateLinkedCellDisplay()/clearManualLink()).
+        placeholder = f"— kein Kapitel {html.escape(number)} in diesem Dokument —"
         inner = (
-            f'<div class="cell cell-empty cell-{side}{page_class}" data-status="{status}">'
-            f'<span class="empty-hint">— kein Kapitel {html.escape(number)} in diesem Dokument —</span>'
+            f'<div class="cell cell-empty cell-{side}{page_class}"{cell_id} data-status="{status}" '
+            f'data-empty-hint="{html.escape(placeholder, quote=True)}">'
+            f'<span class="empty-hint">{placeholder}</span>'
             f"</div>"
         )
     else:
         display_title = _preview_title(title, body_html)
         header = f'<span class="chnum">{html.escape(number)}</span> <span class="chtitle">{html.escape(display_title)}</span>'
         inner = (
-            f'<details class="cell cell-{side}{page_class}" data-status="{status}" {"open" if status != "unchanged" else ""}>'
+            f'<details class="cell cell-{side}{page_class}"{cell_id} data-status="{status}" {"open" if status != "unchanged" else ""}>'
             f"<summary>{header}</summary>"
             f'<div class="chbody">{body_html}</div>'
             f"{_images_html(images)}"
@@ -1531,10 +1573,13 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
         row_moves = r.get("moves", [])
         left_moves = [m for m in row_moves if m["direction"] == "to"]
         right_moves = [m for m in row_moves if m["direction"] == "from"]
+        row_safe_id = _safe_id(r["key"])
         left = _cell(r["number"], r["title_a"], r["html_a"], r.get("images_a", []), "left", status,
-                     page=page_a, first_in_group=first_a[idx], last_in_group=last_a[idx], moves=left_moves)
+                     page=page_a, first_in_group=first_a[idx], last_in_group=last_a[idx], moves=left_moves,
+                     safe_id=row_safe_id)
         right = _cell(r["number"], r["title_b"], r["html_b"], r.get("images_b", []), "right", status,
-                       page=page_b, first_in_group=first_b[idx], last_in_group=last_b[idx], moves=right_moves)
+                       page=page_b, first_in_group=first_b[idx], last_in_group=last_b[idx], moves=right_moves,
+                       safe_id=row_safe_id)
         pct = f'{int(r["ratio"] * 100)}%' if status == "changed" else ""
         img_badge = '<span class="conn-img-badge" title="Grafik geändert">🖼</span>' if r.get("images_changed") else ""
         spine_class = " has-page-spine" if (page_a is not None or page_b is not None) else ""
@@ -1565,6 +1610,7 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
                      autocomplete="off">
               <div class="ml-suggestions" id="mls-{safe_id}"></div>
             </div>
+            <button type="button" class="ml-btn ml-accept" onclick="acceptManualLinkSuggestion('{safe_id}')" title="Vorschlag übernehmen/bestätigen">✓ Übernehmen</button>
             <button type="button" class="ml-btn" onclick="jumpToManualLink('{safe_id}')" title="Zur verknüpften Zeile springen">↷</button>
             <button type="button" class="ml-btn ml-clear" onclick="clearManualLink('{safe_id}')" title="Verknüpfung zurücknehmen">✕</button>
           </div>
@@ -1717,6 +1763,8 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
   .cell-left {{ border-right: none; border-radius: 6px 0 0 6px; }}
   .cell-right {{ border-left: none; border-radius: 0 6px 6px 0; }}
   .cell-empty {{ display: flex; align-items: center; justify-content: center; color: #999; font-size: 12px; font-style: italic; background: #fbfbfb; }}
+  .cell-via-link {{ background: #eff6ff; border-style: dashed; }}
+  .link-badge {{ font-size: 10px; color: #2563eb; font-weight: 600; font-style: normal; margin-left: 6px; }}
   .page-tag {{ font-size: 18px; color: #1e293b; font-weight: 800; letter-spacing: 0.04em; margin: 16px 0 6px 6px; text-transform: uppercase; }}
   .pageband-odd {{ background: #f4f6fa; }}
   summary {{ cursor: pointer; font-weight: 600; }}
@@ -1787,6 +1835,9 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
   .manual-link-box.ml-suggested .manual-link-input {{ border-color: #d97706; border-style: dashed; color: #92400e; }}
   .manual-link-box.ml-suggested label {{ color: #b45309; font-weight: 600; }}
   .ml-suggested-note {{ font-size: 10px; color: #b45309; margin-left: 4px; font-weight: normal; }}
+  .ml-accept {{ display: none; color: #166534; border-color: #16a34a; font-weight: 600; }}
+  .ml-accept:hover {{ background: #f0fdf4; }}
+  .manual-link-box.ml-suggested .ml-accept {{ display: inline-block; }}
   .ml-input-wrap {{ position: relative; flex: 1; }}
   .ml-suggestions {{
     display: none; position: absolute; top: 100%; left: 0; right: 0; z-index: 50;
@@ -2052,23 +2103,99 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
     const box = input.closest('.manual-link-box');
     const val = input.value.trim();
     const ownKey = SAFE_ID_TO_KEY[id];
+    const previousTarget = MANUAL_LINKS[id];  // vor dem Ueberschreiben merken, fuer die Gegenseite
     box.classList.remove('ml-valid', 'ml-invalid');
-    if (!val) {{
-      delete MANUAL_LINKS[id];
-      updateLinkDiff(id);
-      return;
-    }}
-    const foundKey = Object.keys(CHAPTER_KEYS).find(function(k) {{
-      return CHAPTER_KEYS[k] === val && k !== ownKey;
-    }});
-    if (foundKey) {{
-      MANUAL_LINKS[id] = foundKey;
-      box.classList.add('ml-valid');
+
+    let newTarget = null;
+    if (val) {{
+      const foundKey = Object.keys(CHAPTER_KEYS).find(function(k) {{
+        return CHAPTER_KEYS[k] === val && k !== ownKey;
+      }});
+      if (foundKey) {{
+        newTarget = foundKey;
+        MANUAL_LINKS[id] = foundKey;
+        box.classList.add('ml-valid');
+      }} else {{
+        delete MANUAL_LINKS[id];
+        box.classList.add('ml-invalid');
+      }}
     }} else {{
       delete MANUAL_LINKS[id];
-      box.classList.add('ml-invalid');
     }}
+
     updateLinkDiff(id);
+    updateLinkedCellDisplay(id, ownKey, previousTarget, newTarget);
+  }}
+
+  // Original-HTML jeder leeren Zelle ("kein Kapitel X in diesem Dokument")
+  // vor jeder Veraenderung zwischenspeichern - damit eine spaeter entfernte
+  // Verknuepfung die Zelle wieder EXAKT auf den Ursprungszustand zuruecksetzen
+  // kann, egal wie oft sie zwischenzeitlich per Verknuepfung ersetzt wurde.
+  const ORIGINAL_EMPTY_CELLS = {{}};
+  document.querySelectorAll('.cell-empty[id]').forEach(function(el) {{
+    ORIGINAL_EMPTY_CELLS[el.id] = el.outerHTML;
+  }});
+
+  function fillCellsFromLink(ownSafeId, targetKey) {{
+    // Kernlogik: fuellt die leeren Zellen von ownSafeId mit dem Inhalt von
+    // targetKey (falls vorhanden und echt), sonst wird der Original-
+    // Platzhalter wiederhergestellt. Wird sowohl fuer die Zeile aufgerufen,
+    // in der die Verknuepfung tatsaechlich eingetragen wurde, als auch
+    // (gespiegelt) fuer die Zielzeile - OHNE dort MANUAL_LINKS zu setzen,
+    // nur die Anzeige wird gespiegelt, nicht die Verknuepfung selbst.
+    ['left', 'right'].forEach(function(side) {{
+      const cellId = 'cell-' + side + '-' + ownSafeId;
+      const currentCell = document.getElementById(cellId);
+      if (!currentCell) {{ return; }}
+      const originalHtml = ORIGINAL_EMPTY_CELLS[cellId];
+      if (originalHtml === undefined) {{ return; }}  // war nie leer (echter Inhalt) -> nie anfassen
+
+      if (targetKey) {{
+        const targetSafeId = KEY_TO_SAFE_ID[targetKey];
+        const targetCellId = targetSafeId ? ('cell-' + side + '-' + targetSafeId) : null;
+        const targetCell = targetCellId ? document.getElementById(targetCellId) : null;
+        const targetIsReal = targetCell && ORIGINAL_EMPTY_CELLS[targetCellId] === undefined;
+        if (targetIsReal) {{
+          const clone = targetCell.cloneNode(true);
+          clone.id = cellId;
+          clone.classList.add('cell-via-link');
+          if (!clone.hasAttribute('open')) {{ clone.setAttribute('open', ''); }}
+          const summary = clone.querySelector('summary');
+          if (summary && !summary.querySelector('.link-badge')) {{
+            const badge = document.createElement('span');
+            badge.className = 'link-badge';
+            badge.title = 'Inhalt via manuelle Verknüpfung mit Kapitel ' + (CHAPTER_KEYS[targetKey] || targetKey) +
+                           ' - kein eigener Treffer in diesem Dokument';
+            badge.textContent = ' 🔗 via Verknüpfung';
+            summary.appendChild(badge);
+          }}
+          currentCell.replaceWith(clone);
+          return;
+        }}
+      }}
+      // Kein (gueltiges) Ziel mehr -> Original-Platzhalter wiederherstellen
+      if (!currentCell.classList.contains('cell-empty')) {{
+        const temp = document.createElement('div');
+        temp.innerHTML = originalHtml;
+        currentCell.replaceWith(temp.firstElementChild);
+      }}
+    }});
+  }}
+
+  function updateLinkedCellDisplay(id, ownKey, previousTarget, newTarget) {{
+    // Fuellt die eigene Zeile UND spiegelt die Anzeige symmetrisch auf der
+    // Zielzeile - eine Verknuepfung gehoert konzeptionell zu BEIDEN Zeilen,
+    // auch wenn MANUAL_LINKS sie nur einseitig speichert (auf der Zeile, wo
+    // das Eingabefeld tatsaechlich ausgefuellt wurde).
+    fillCellsFromLink(id, newTarget);
+    if (previousTarget && previousTarget !== newTarget) {{
+      const prevSafeId = KEY_TO_SAFE_ID[previousTarget];
+      if (prevSafeId) {{ fillCellsFromLink(prevSafeId, null); }}
+    }}
+    if (newTarget) {{
+      const targetSafeId = KEY_TO_SAFE_ID[newTarget];
+      if (targetSafeId) {{ fillCellsFromLink(targetSafeId, ownKey); }}
+    }}
   }}
 
   // Eigenes, selbst gerendertes Such-Dropdown statt der nativen
@@ -2124,6 +2251,15 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
     markManualLinkAsConfirmed(id);
     onManualLinkChange(id);
     showManualLinkSuggestions(id);
+  }}
+
+  function acceptManualLinkSuggestion(id) {{
+    // Expliziter "✓ Übernehmen"-Button: bestaetigt einen automatischen
+    // Vorschlag UNVERAENDERT, ohne dass der Nutzer den Wert neu eintippen
+    // muss. Wert im Feld bleibt gleich, nur der Zustand wechselt von
+    // "Vorschlag" zu "vom Nutzer bestaetigt".
+    markManualLinkAsConfirmed(id);
+    onManualLinkChange(id);
   }}
 
   function selectManualLinkSuggestion(id, number) {{
@@ -2308,6 +2444,7 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
           '<span class="ml-suggested-note">von mir vorgeschlagen, bitte prüfen</span>';
       }}
       updateLinkDiff(safeId);
+      updateLinkedCellDisplay(safeId, m.from, null, m.to);
     }});
   }}
   applySuggestedMoves();

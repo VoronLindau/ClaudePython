@@ -1,6 +1,23 @@
 #!/usr/bin/env python3
 """
 docx_chapter_compare_gui.py
+Version 3.0 / 2026-09-30 / Grund: Splash-Screen kann jetzt zusaetzlich zum
+    bisherigen FirmenLogo.JPG auch ein FirmenLogo.mp4-Video abspielen (Video
+    hat Vorrang, faellt aber sauber auf das Bild zurueck, falls keine .mp4
+    vorhanden ist oder die dafuer noetige NEUE Abhaengigkeit opencv-python
+    fehlt - 'pip install opencv-python'). Tkinter kann von Haus aus keine
+    Videos abspielen, daher komplett selbstgebaut: Frames werden einzeln per
+    OpenCV ausgelesen, nach RGB konvertiert und als PhotoImage im Label
+    angezeigt, mit aus der Videodatei ausgelesener Bildrate getaktet. Die
+    Splash-Anzeigedauer richtet sich bei Video nach der tatsaechlichen
+    Videolaenge (gedeckelt auf maximal 8 Sekunden, falls das Firmenvideo
+    laenger ist). Bisherige Bild-Animation (Spotlight-Effekt) unveraendert
+    in eine eigene Methode ausgelagert, keine Verhaltensaenderung dort. Mit
+    einem synthetisch erzeugten Test-MP4 (50 Frames, 25fps) end-to-end
+    verifiziert: Oeffnen, FPS-/Laengenberechnung, Frame-Auslesen und
+    -Konvertierung funktionieren korrekt; GUI-Klasse laedt mit allen drei
+    Splash-Methoden fehlerfrei.
+
 Version 2.9 / 2026-09-30 / Grund: Zwei neue Kontrollkaestchen "Kapitelnummer
     aus Ueberschriftentext erkennen" fuer Dokument A und Dokument B separat -
     steuert die in Core v3.16/3.17 ergaenzte Erkennung fuer PDF->Word-
@@ -19,7 +36,7 @@ import webbrowser
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-GUI_VERSION = "2.9"
+GUI_VERSION = "3.0"
 
 try:
     import docx_chapter_compare as _core
@@ -170,113 +187,203 @@ class CompareApp(tk.Tk):
 
 
     def _show_splash_and_start(self):
-        self.withdraw()  
-        
+        self.withdraw()
+
         splash = tk.Toplevel(self)
         splash.overrideredirect(True)
         splash.attributes('-topmost', True)
-        
+
         width, height = 450, 300
         x = (splash.winfo_screenwidth() - width) // 2
         y = (splash.winfo_screenheight() - height) // 2
         splash.geometry(f"{width}x{height}+{x}+{y}")
         splash.configure(background="white")
-        
+
         frame = tk.Frame(splash, bg="white")
         frame.pack(fill="both", expand=True)
-        
+
         script_dir = Path(__file__).resolve().parent
+        video_path = script_dir / "FirmenLogo.mp4"
         logo_path = script_dir / "FirmenLogo.JPG"
-        logo_loaded = False
-        
+
         self._splash_label = tk.Label(frame, bg="white")
         self._splash_label.place(x=0, y=0, width=width, height=height)
-        
+
         version_label = tk.Label(
-            frame, 
-            text=f"Lade Version {GUI_VERSION} (Core {CORE_VERSION})...", 
-            font=("Arial", 10, "bold"), 
+            frame,
+            text=f"Lade Version {GUI_VERSION} (Core {CORE_VERSION})...",
+            font=("Arial", 10, "bold"),
             bg="#555555",
             fg="white",
             padx=10,
             pady=4
         )
         version_label.place(relx=0.5, rely=0.9, anchor="center")
-        
-        if logo_path.exists():
-            try:
-                from PIL import Image, ImageTk, ImageDraw
-                import math  
-                
-                img = Image.open(logo_path).convert("RGBA")
-                resample_filter = getattr(Image, 'Resampling', Image).LANCZOS 
-                img = img.resize((width, height), resample_filter)
-                w, h = img.size
-                
-                spot_size = int(max(w, h) * 0.8)  
-                spot = Image.new("RGBA", (spot_size, spot_size), (255, 255, 255, 0))
-                draw = ImageDraw.Draw(spot)
-                
-                cx, cy = spot_size // 2, spot_size // 2
-                radius = spot_size // 2
-                
-                for r_step in range(radius, 0, -2):
-                    dist = r_step / radius
-                    alpha = int(170 * (1 - dist**2))  
-                    draw.ellipse(
-                        [(cx - r_step, cy - r_step), (cx + r_step, cy + r_step)], 
-                        fill=(255, 255, 255, alpha)
-                    )
-                
-                self._anim_frame = 0
-                self._anim_max_frames = 100  
-                
-                def update_animation():
-                    if not splash.winfo_exists():
-                        return
-                        
-                    progress = (self._anim_frame % self._anim_max_frames) / self._anim_max_frames
-                    
-                    if progress < 0.65:  
-                        eff_progress = progress / 0.65
-                        current_x = int(-spot_size + eff_progress * (w + spot_size))
-                        base_y = (h - spot_size) / 2
-                        current_y = int(base_y + math.sin(eff_progress * math.pi) * (h * 0.15))
-                        
-                        overlay = Image.new("RGBA", (w, h), (255, 255, 255, 0))
-                        overlay.paste(spot, (current_x, current_y), spot)
-                        
-                        composite = Image.alpha_composite(img, overlay)
-                        photo = ImageTk.PhotoImage(composite)
-                    else:
-                        photo = ImageTk.PhotoImage(img)
-                        
-                    self._splash_label.config(image=photo)
-                    self._splash_label.image = photo 
-                    
-                    self._anim_frame += 1
-                    splash.after(33, update_animation) 
-                
-                update_animation()
-                logo_loaded = True
-                
-            except ImportError:
-                self._splash_label.config(text="FirmenLogo.JPG gefunden, aber 'Pillow' fehlt!\n'pip install Pillow'", fg="red")
-            except Exception as e:
-                self._splash_label.config(text=f"Fehler beim Laden:\n{e}", fg="red")
-        else:
-            self._splash_label.config(text="Kein FirmenLogo.JPG im Ordner gefunden.", fg="gray")
-            
-        if not logo_loaded:
+
+        # Video hat Vorrang vor dem Bild, faellt aber sauber zurueck, falls
+        # entweder keine .mp4 vorhanden ist oder die dafuer noetige
+        # Zusatzbibliothek (opencv-python) fehlt - dann normales JPG-Verhalten
+        # wie bisher, ganz ohne Video.
+        close_delay = None
+        if video_path.exists():
+            close_delay = self._try_play_video_splash(splash, width, height, video_path)
+        if close_delay is None and logo_path.exists():
+            close_delay = self._try_play_image_splash(splash, width, height, logo_path)
+        if close_delay is None:
+            if video_path.exists() or logo_path.exists():
+                # Datei(en) vorhanden, aber Wiedergabe ist an beiden
+                # fehlgeschlagen (z.B. fehlende Bibliothek/defekte Datei) -
+                # der genaue Grund steht dann bereits im Label.
+                pass
+            else:
+                self._splash_label.config(text="Weder FirmenLogo.mp4 noch FirmenLogo.JPG im Ordner gefunden.", fg="gray")
             fallback_label = tk.Label(frame, text="Kapitelvergleich Tool", font=("Arial", 16, "bold"), bg="white")
             fallback_label.place(relx=0.5, rely=0.4, anchor="center")
-            
-        self.after(5000, lambda: self._close_splash(splash))
- 
- 
+            close_delay = 2500
+
+        self.after(close_delay, lambda: self._close_splash(splash))
+
+    def _try_play_video_splash(self, splash, width, height, video_path):
+        """Versucht, FirmenLogo.mp4 abzuspielen. Gibt die empfohlene
+        Schliesszeit in ms zurueck (an die - ggf. gedeckelte - Videolaenge
+        gekoppelt), oder None, falls die Wiedergabe nicht moeglich war
+        (z.B. weil opencv-python fehlt oder die Datei defekt ist) - der
+        Aufrufer faellt dann automatisch auf das JPG zurueck. Tkinter kann
+        von Haus aus keine Videos abspielen - das laeuft hier komplett
+        selbstgebaut: Frame fuer Frame per OpenCV auslesen, nach RGB
+        konvertieren und als PhotoImage im Label anzeigen."""
+        try:
+            import cv2
+            from PIL import Image, ImageTk
+        except ImportError:
+            self._splash_label.config(
+                text="FirmenLogo.mp4 gefunden, aber 'opencv-python' fehlt!\n'pip install opencv-python'",
+                fg="red",
+            )
+            return None
+
+        cap = None
+        try:
+            cap = cv2.VideoCapture(str(video_path))
+            if not cap.isOpened():
+                cap.release()
+                self._splash_label.config(text="FirmenLogo.mp4 konnte nicht geöffnet werden.", fg="red")
+                return None
+
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            if not fps or fps <= 0 or fps > 120:
+                fps = 25.0  # unplausibler Wert (manche Codecs liefern 0) - sinnvoller Standard
+            frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+            video_duration_ms = (frame_count / fps) * 1000 if frame_count > 0 else 5000
+            MAX_SPLASH_VIDEO_MS = 8000  # Deckel, falls das Firmenvideo sehr lang ist
+            close_delay = int(min(video_duration_ms, MAX_SPLASH_VIDEO_MS)) if video_duration_ms > 0 else 5000
+            frame_delay_ms = max(1, int(1000 / fps))
+
+            def play_next_frame():
+                if not splash.winfo_exists():
+                    cap.release()
+                    return
+                ret, cv_frame = cap.read()
+                if not ret:
+                    cap.release()
+                    return  # Video zu Ende - Splash schliesst sich ueber die zentral geplante Schliesszeit
+                rgb_frame = cv2.cvtColor(cv_frame, cv2.COLOR_BGR2RGB)
+                resized = cv2.resize(rgb_frame, (width, height))
+                photo = ImageTk.PhotoImage(Image.fromarray(resized))
+                self._splash_label.config(image=photo)
+                self._splash_label.image = photo
+                splash.after(frame_delay_ms, play_next_frame)
+
+            play_next_frame()
+            self._splash_cap = cap  # Referenz halten, damit _close_splash sie sauber freigeben kann
+            return close_delay
+        except Exception as e:
+            if cap is not None:
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+            self._splash_label.config(text=f"Fehler beim Abspielen von FirmenLogo.mp4:\n{e}", fg="red")
+            return None
+
+    def _try_play_image_splash(self, splash, width, height, logo_path):
+        """Bisheriges Verhalten (Spotlight-Animation ueber ein statisches
+        Bild) - unveraendert, nur in eine eigene Methode ausgelagert. Gibt
+        die Schliesszeit (fest 5000ms wie bisher) zurueck, oder None bei
+        Fehlschlag (z.B. fehlendes Pillow)."""
+        try:
+            from PIL import Image, ImageTk, ImageDraw
+            import math
+
+            img = Image.open(logo_path).convert("RGBA")
+            resample_filter = getattr(Image, 'Resampling', Image).LANCZOS
+            img = img.resize((width, height), resample_filter)
+            w, h = img.size
+
+            spot_size = int(max(w, h) * 0.8)
+            spot = Image.new("RGBA", (spot_size, spot_size), (255, 255, 255, 0))
+            draw = ImageDraw.Draw(spot)
+
+            cx, cy = spot_size // 2, spot_size // 2
+            radius = spot_size // 2
+
+            for r_step in range(radius, 0, -2):
+                dist = r_step / radius
+                alpha = int(170 * (1 - dist**2))
+                draw.ellipse(
+                    [(cx - r_step, cy - r_step), (cx + r_step, cy + r_step)],
+                    fill=(255, 255, 255, alpha)
+                )
+
+            self._anim_frame = 0
+            self._anim_max_frames = 100
+
+            def update_animation():
+                if not splash.winfo_exists():
+                    return
+
+                progress = (self._anim_frame % self._anim_max_frames) / self._anim_max_frames
+
+                if progress < 0.65:
+                    eff_progress = progress / 0.65
+                    current_x = int(-spot_size + eff_progress * (w + spot_size))
+                    base_y = (h - spot_size) / 2
+                    current_y = int(base_y + math.sin(eff_progress * math.pi) * (h * 0.15))
+
+                    overlay = Image.new("RGBA", (w, h), (255, 255, 255, 0))
+                    overlay.paste(spot, (current_x, current_y), spot)
+
+                    composite = Image.alpha_composite(img, overlay)
+                    photo = ImageTk.PhotoImage(composite)
+                else:
+                    photo = ImageTk.PhotoImage(img)
+
+                self._splash_label.config(image=photo)
+                self._splash_label.image = photo
+
+                self._anim_frame += 1
+                splash.after(33, update_animation)
+
+            update_animation()
+            return 5000
+
+        except ImportError:
+            self._splash_label.config(text="FirmenLogo.JPG gefunden, aber 'Pillow' fehlt!\n'pip install Pillow'", fg="red")
+            return None
+        except Exception as e:
+            self._splash_label.config(text=f"Fehler beim Laden:\n{e}", fg="red")
+            return None
+
     def _close_splash(self, splash):
+        cap = getattr(self, '_splash_cap', None)
+        if cap is not None:
+            try:
+                cap.release()
+            except Exception:
+                pass
+            self._splash_cap = None
         splash.destroy()
-        self.deiconify() 
+        self.deiconify()
 
     def _build_ui(self):
         frame = ttk.Frame(self)

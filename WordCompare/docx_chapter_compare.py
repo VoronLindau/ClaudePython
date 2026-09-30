@@ -1,6 +1,53 @@
 #!/usr/bin/env python3
 """
 docx_chapter_compare.py
+Version 3.17 / 2026-09-30 / Grund: extract_chapters() bekommt einen neuen
+    Parameter allow_heading_typed_number (Standard: True), der die in v3.16
+    ergaenzte Erkennung von Kapitelnummern aus reinem Ueberschriftentext
+    (PDF->Word-Konvertierungsartefakt) separat pro Dokument abschaltbar
+    macht - auf Nutzer-Nachfrage, da diese Heuristik NICHT wasserdicht ist
+    (eine echte Ueberschrift, die zufaellig mit einer Zahl beginnt, z.B.
+    "24 Stunden Support", wuerde faelschlich als Kapitelnummer "24"
+    interpretiert). Neue CLI-Schalter --no-heading-number-a/--no-heading-
+    number-b. Mit gezieltem Test verifiziert: Abschalten wirkt nur auf das
+    jeweils angegebene Dokument, das andere bleibt unveraendert; Standard-
+    verhalten (beide an) unveraendert regressionsgetestet.
+
+Version 3.16 / 2026-09-30 / Grund: Zwei Ergaenzungen auf Nutzerwunsch.
+
+    (1) Automatische Verschiebungs-Vorschlaege werden jetzt beim Laden des
+    Berichts direkt in die "Manuell verknuepfen"-Felder VORAUSGEFUELLT, statt
+    nur als Hinweistext zu erscheinen - klar als "🤖 Vorschlag (XX% aehnlich):
+    von mir vorgeschlagen, bitte pruefen" markiert (gelber, gestrichelter
+    Rahmen, eigener Zustand ml-suggested - unterscheidet sich bewusst von
+    der blauen "ml-valid"-Markierung fuer selbst gesetzte Verknuepfungen).
+    Der Diff wird sofort mitgeliefert. Bearbeitet der Nutzer das Feld
+    (Tastatureingabe oder Klick auf einen Vorschlag aus der Liste), wird der
+    Vorschlags-Status automatisch zu einer normalen, bestaetigten
+    Verknuepfung - importierte Verknuepfungen aus einer JSON-Datei ueber-
+    schreiben einen evtl. vorherigen Vorschlags-Status ebenfalls korrekt.
+    Ein unveraendert gelassener Vorschlag wird beim Review-Export trotzdem
+    mit gespeichert (stillschweigendes Uebernehmen zaehlt als Entscheidung
+    des Nutzers). Mit einem gezielten Testfall verifiziert: Vorschlag
+    erscheint korrekt vorausgefuellt + markiert, wechselt nach Bearbeitung
+    korrekt zu "bestaetigt", wird unveraendert korrekt exportiert.
+
+    (2) Neue Kapitel-Erkennung fuer PDF->Word-konvertierte Dokumente: Wird
+    ein Absatz mit echter Ueberschriften-Formatvorlage ("Heading"/
+    "Überschrift") gefunden, aber OHNE automatische Nummerierung (haeufiges
+    Konvertierungsartefakt - die Kapitelnummer landet dann als reiner Text
+    OHNE Tab direkt vor dem Titel, z.B. "5.1 Systemuebersicht" als ein
+    einziger String), wird das jetzt korrekt als Kapitelanfang erkannt
+    (neues Muster HEADING_NUMBER_SPACE_RE, nur auf Heading-Absaetze ohne
+    automatische Nummer angewendet - verhindert Fehlalarme bei normalem
+    Fliesstext, der zufaellig mit einer Zahl beginnt). Dadurch funktioniert
+    jetzt auch der Vergleich zwischen einem so konvertierten Dokument und
+    einem Dokument mit echter Formatvorlagen-Nummerierung, da am Ende in
+    beiden Faellen dieselbe Kapitelnummer als Schluessel herauskommt. Mit
+    einem direkten Vergleich zwischen Scope1.docx (echte Nummerierung) und
+    einem nachgebauten PDF-Import-Pendant verifiziert: alle 6 getesteten
+    Kapitel wurden korrekt als "unveraendert" zueinander gematcht.
+
 Version 3.15 / 2026-09-29 / Grund: Bugfix - der Wort-Diff bei manueller
     Kapitel-Verknuepfung zeigte bei bestimmten Verlinkungsrichtungen alte und
     neue Fassung INVERTIERT an (neuer Text faelschlich rot als "entfernt",
@@ -130,7 +177,7 @@ from docx.shared import Pt, RGBColor, Twips
 from docx.text.paragraph import Paragraph
 from lxml import etree
 
-SCRIPT_VERSION = "3.15"
+SCRIPT_VERSION = "3.17"
 REVIEW_SCHEMA_VERSION = "1.0"
 
 REVIEW_STATUS_OPTIONS = [
@@ -148,6 +195,30 @@ REVIEW_STATUS_OPTIONS = [
 ANCHOR_TAB_RE = re.compile(r"^(\d+(?:\.\d+)*[a-zA-Z]?)\s*\t\s*(.*)$")
 BARE_NUMBER_RE = re.compile(r"^(\d+[a-zA-Z]?)$")
 DOT_CONTINUATION_RE = re.compile(r"^\.(\d+(?:\.\d+)*[a-zA-Z]?)\s*\t?\s*(.*)$")
+# Fuer PDF->Word-konvertierte Dokumente: die Kapitelnummer wurde beim
+# Import als reiner Text VOR den Titel geschrieben, OHNE Tab dazwischen
+# (z.B. "5.1 Systemuebersicht" als ein einziger String) und OHNE echte
+# Formatvorlagen-Nummerierung (numPr) - nur ein Leerzeichen trennt Nummer
+# und Titel. Wird NUR angewendet, wenn der Absatz eine echte Heading-/
+# Ueberschrift-Formatvorlage traegt (siehe _is_heading_style) UND keine
+# automatische Nummer gefunden wurde - sonst wuerden gewoehnliche
+# Fliesstext-Saetze, die zufaellig mit einer Zahl beginnen (z.B. "5 Stueck
+# wurden geliefert."), faelschlich als Kapitelanfang erkannt.
+HEADING_NUMBER_SPACE_RE = re.compile(r"^(\d+(?:\.\d+)*[a-zA-Z]?)[ \t\u00A0]+(.+)$")
+_HEADING_STYLE_NAME_RE = re.compile(r"heading|überschrift|ueberschrift", re.IGNORECASE)
+
+
+def _is_heading_style(paragraph):
+    """True, wenn der Absatz eine Formatvorlage traegt, deren Name auf eine
+    Ueberschrift hindeutet ("Heading 1", "Überschrift 2", ...). Rein
+    namensbasiert (nicht auf outlineLvl angewiesen), da PDF->Word-Importe
+    die Formatvorlage meist korrekt mitbringen, auch wenn die automatische
+    Nummerierung dabei verloren geht."""
+    try:
+        name = paragraph.style.name or ""
+    except Exception:
+        return False
+    return bool(_HEADING_STYLE_NAME_RE.search(name))
 WEB_SAFE_IMAGE_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/gif", "image/bmp", "image/webp"}
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 
@@ -363,7 +434,17 @@ _TOC_EXIT_TEXT_LEN = 200
 _TOC_LINE_RE = re.compile(r"(?:\.{5,}|\t)[ \t]*\d+[ \t]*$")
 
 
-def extract_chapters(docx_path):
+def extract_chapters(docx_path, allow_heading_typed_number=True):
+    """allow_heading_typed_number steuert die in v3.16 ergaenzte Erkennung
+    fuer PDF->Word-konvertierte Dokumente (Kapitelnummer als reiner Text vor
+    dem Titel in einer Ueberschrift, ohne echte Nummerierung). Diese
+    Heuristik ist NICHT wasserdicht - eine echte Ueberschrift, die zufaellig
+    mit einer Zahl beginnt (z.B. "24 Stunden Support"), wuerde faelschlich
+    als Kapitelnummer "24" interpretiert. Sie greift zwar nur bei Absaetzen
+    OHNE echte Formatvorlagen-Nummerierung (ist insofern schon "selbst-
+    sperrend"), kann aber bei Bedarf pro Dokument separat abgeschaltet
+    werden, falls fuer eines der beiden Dokumente zusaetzliche Sicherheit
+    gewuenscht ist."""
     doc = Document(docx_path)
     num_to_abstract, abstract_levels, style_linked = _load_numbering_definitions(docx_path)
     style_numpr = _load_style_numpr(docx_path)
@@ -472,11 +553,22 @@ def extract_chapters(docx_path):
             m_tab = ANCHOR_TAB_RE.match(text)
             m_dot = DOT_CONTINUATION_RE.match(text)
             m_bare = BARE_NUMBER_RE.match(text)
+            # Nur versuchen, wenn kein praeziserer Tab-Treffer vorliegt UND
+            # der Absatz tatsaechlich eine Ueberschriften-Formatvorlage
+            # traegt - sonst wuerde z.B. ein Fliesstext-Satz wie "5 Stueck
+            # wurden ausgeliefert." faelschlich als Kapitelanfang erkannt.
+            m_heading_typed = None if (m_tab or not allow_heading_typed_number) else (
+                HEADING_NUMBER_SPACE_RE.match(text) if _is_heading_style(para) else None
+            )
 
             if m_tab:
                 pending_numbers.clear()
                 new_chapter(m_tab.group(1), source="tab_anchor")
                 append_text(m_tab.group(2))
+            elif m_heading_typed:
+                pending_numbers.clear()
+                new_chapter(m_heading_typed.group(1), source="heading_typed_number")
+                append_text(m_heading_typed.group(2))
             elif m_dot and pending_numbers:
                 base = pending_numbers.pop(0)
                 new_chapter(f"{base}.{m_dot.group(1)}", source="dot_continuation")
@@ -1463,12 +1555,12 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
         manual_link_box = f"""
         <div class="manual-link-box" data-link-key="{html.escape(r['key'], quote=True)}">
           <div class="ml-row">
-            <label for="ml-{safe_id}">🔗 Manuell verknüpfen mit:</label>
+            <label for="ml-{safe_id}" id="mll-{safe_id}">🔗 Manuell verknüpfen mit:</label>
             <div class="ml-input-wrap">
               <input type="text" id="ml-{safe_id}" class="manual-link-input"
                      placeholder="Kapitelnummer eingeben oder suchen…"
                      oninput="onManualLinkInput('{safe_id}')"
-                     onfocus="onManualLinkInput('{safe_id}')"
+                     onfocus="showManualLinkSuggestions('{safe_id}')"
                      onblur="hideManualLinkSuggestions('{safe_id}')"
                      autocomplete="off">
               <div class="ml-suggestions" id="mls-{safe_id}"></div>
@@ -1565,6 +1657,16 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
     # sind von dieser Sonderregel nicht betroffen, deshalb hier zusaetzlich
     # als Array in der tatsaechlichen Kapitel-Reihenfolge bereitgestellt.
     chapter_list_json = json.dumps([{"key": r["key"], "number": r["number"]} for r in rows], ensure_ascii=False)
+    # Automatisch erkannte Verschiebungen als Vorschlaege fuer die manuelle
+    # Verknuepfung - werden beim Laden des Berichts vorausgefuellt, aber klar
+    # als "Vorschlag" markiert, bis der Nutzer sie bestaetigt (bearbeitet)
+    # oder verwirft. Nur Eintraege, bei denen sowohl from_key als auch
+    # to_key tatsaechlich unter den Zeilen existieren (sollte immer der Fall
+    # sein, da detect_possible_moves() direkt auf 'rows' arbeitet).
+    suggested_moves_json = json.dumps(
+        [{"from": m["from_key"], "to": m["to_key"], "score": round(m["score"], 2)} for m in (moves or [])],
+        ensure_ascii=False,
+    )
     safe_id_to_key_json = json.dumps({_safe_id(r["key"]): r["key"] for r in rows}, ensure_ascii=False)
     row_texts_json = json.dumps(
         {r["key"]: {"a": r.get("text_a_raw") or "", "b": r.get("text_b_raw") or ""} for r in rows},
@@ -1681,6 +1783,10 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
   .manual-link-box.ml-valid {{ background: #eff6ff; }}
   .manual-link-box.ml-valid .manual-link-input {{ border-color: #2563eb; color: #1d4ed8; }}
   .manual-link-box.ml-invalid .manual-link-input {{ border-color: #dc2626; color: #b91c1c; }}
+  .manual-link-box.ml-suggested {{ background: #fffbeb; }}
+  .manual-link-box.ml-suggested .manual-link-input {{ border-color: #d97706; border-style: dashed; color: #92400e; }}
+  .manual-link-box.ml-suggested label {{ color: #b45309; font-weight: 600; }}
+  .ml-suggested-note {{ font-size: 10px; color: #b45309; margin-left: 4px; font-weight: normal; }}
   .ml-input-wrap {{ position: relative; flex: 1; }}
   .ml-suggestions {{
     display: none; position: absolute; top: 100%; left: 0; right: 0; z-index: 50;
@@ -1745,6 +1851,7 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
   const REVIEW_STATUS_VALUES = ['accepted', 'not_accepted', 'refinement_customer', 'internal_clarification'];
   const CHAPTER_KEYS = {chapter_keys_json};
   const CHAPTER_LIST = {chapter_list_json};  // gleiche Daten, aber als Array - garantiert Dokumentreihenfolge (siehe Kommentar bei chapter_list_json)
+  const SUGGESTED_MOVES = {suggested_moves_json};  // automatisch erkannte Verschiebungen, werden beim Laden vorausgefuellt
   const SAFE_ID_TO_KEY = {safe_id_to_key_json};
   const ROW_TEXTS = {row_texts_json};
   const KEY_TO_SAFE_ID = Object.fromEntries(Object.entries(SAFE_ID_TO_KEY).map(function(e) {{ return [e[1], e[0]]; }}));
@@ -1973,8 +2080,7 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
   // nur Praefix) und zeigt garantiert ALLE passenden Treffer.
   const ML_MAX_SUGGESTIONS = 40;
 
-  function onManualLinkInput(id) {{
-    onManualLinkChange(id);
+  function showManualLinkSuggestions(id) {{
     const input = document.getElementById('ml-' + id);
     const box = document.getElementById('mls-' + id);
     if (!input || !box) {{ return; }}
@@ -2004,9 +2110,26 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
     box.classList.add('ml-suggestions-open');
   }}
 
+  function markManualLinkAsConfirmed(id) {{
+    // Sobald der Nutzer ein Feld selbst bearbeitet (egal ob es vorher ein
+    // automatischer Vorschlag war oder leer), gilt es ab jetzt als vom
+    // Nutzer bestaetigt/gesetzt - der "Vorschlag"-Hinweis verschwindet.
+    const box = document.getElementById('ml-' + id).closest('.manual-link-box');
+    const label = document.getElementById('mll-' + id);
+    box.classList.remove('ml-suggested');
+    if (label) {{ label.innerHTML = '🔗 Manuell verknüpfen mit:'; }}
+  }}
+
+  function onManualLinkInput(id) {{
+    markManualLinkAsConfirmed(id);
+    onManualLinkChange(id);
+    showManualLinkSuggestions(id);
+  }}
+
   function selectManualLinkSuggestion(id, number) {{
     const input = document.getElementById('ml-' + id);
     input.value = number;
+    markManualLinkAsConfirmed(id);
     onManualLinkChange(id);
     hideManualLinkSuggestions(id);
   }}
@@ -2125,6 +2248,7 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
       const targetNumber = CHAPTER_KEYS[targetKey];
       if (!input || !targetNumber) {{ linkUnmatched++; return; }}
       input.value = targetNumber;
+      markManualLinkAsConfirmed(safeId);
       onManualLinkChange(safeId);
       linkMatched++;
     }});
@@ -2158,6 +2282,35 @@ def render_html(rows, stats, name_a, name_b, ignore_linebreaks=True, meta_a=None
     }}
     alert('Review importiert: ' + matched + ' Kapitel, ' + linkMatched + ' Verknüpfung(en).');
   }}
+
+  // Automatisch erkannte Verschiebungen (SUGGESTED_MOVES) als vorausgefuellte
+  // Vorschlaege setzen - klar als "🤖 Vorschlag" markiert, NICHT als vom
+  // Nutzer bestaetigte Verknuepfung (ml-valid). Der Nutzer sieht sofort den
+  // Diff und kann den Vorschlag entweder so lassen (bleibt als Vorschlag im
+  // Browser sichtbar, wird aber erst beim Review-Export mit-gespeichert wie
+  // jede andere Verknuepfung), gezielt bearbeiten (wird dann zu einer
+  // normalen, bestaetigten Verknuepfung) oder ueber "✕" verwerfen.
+  function applySuggestedMoves() {{
+    SUGGESTED_MOVES.forEach(function(m) {{
+      const safeId = KEY_TO_SAFE_ID[m.from];
+      const targetNumber = CHAPTER_KEYS[m.to];
+      if (!safeId || !targetNumber) {{ return; }}
+      const input = document.getElementById('ml-' + safeId);
+      const box = input ? input.closest('.manual-link-box') : null;
+      const label = document.getElementById('mll-' + safeId);
+      if (!input || !box) {{ return; }}
+      input.value = targetNumber;
+      MANUAL_LINKS[safeId] = m.to;
+      box.classList.add('ml-suggested');
+      box.classList.remove('ml-valid', 'ml-invalid');
+      if (label) {{
+        label.innerHTML = '🤖 Vorschlag (' + Math.round(m.score * 100) + '% ähnlich):' +
+          '<span class="ml-suggested-note">von mir vorgeschlagen, bitte prüfen</span>';
+      }}
+      updateLinkDiff(safeId);
+    }});
+  }}
+  applySuggestedMoves();
 </script>
 </body>
 </html>
@@ -2411,6 +2564,11 @@ def main():
     parser.add_argument("--review-json", default=None, metavar="PFAD", help="Review JSON-Datei einlesen.")
     parser.add_argument("--diagnostic-report", nargs="?", const="", default=None, metavar="PFAD", help="Diagnose-Report erzeugen.")
     parser.add_argument("--diagnostic-step-timeout", type=int, default=90, metavar="SEKUNDEN", help="Timeout je Schritt.")
+    parser.add_argument("--no-heading-number-a", action="store_true",
+                         help="Fuer Dokument A: Kapitelnummer-Erkennung aus reinem Ueberschriftentext "
+                              "(PDF->Word-Konvertierungsartefakt) abschalten.")
+    parser.add_argument("--no-heading-number-b", action="store_true",
+                         help="Wie --no-heading-number-a, aber fuer Dokument B.")
     args = parser.parse_args()
 
     if args.diagnose_pages:
@@ -2445,8 +2603,8 @@ def main():
             print(f"Datei nicht gefunden: {p}", file=sys.stderr)
             sys.exit(1)
 
-    chapters_a = extract_chapters(path_a)
-    chapters_b = extract_chapters(path_b)
+    chapters_a = extract_chapters(path_a, allow_heading_typed_number=not args.no_heading_number_a)
+    chapters_b = extract_chapters(path_b, allow_heading_typed_number=not args.no_heading_number_b)
 
     pages_method = None
     diagnostics = None

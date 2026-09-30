@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """
 docx_chapter_compare_gui.py
+Version 2.9 / 2026-09-30 / Grund: Zwei neue Kontrollkaestchen "Kapitelnummer
+    aus Ueberschriftentext erkennen" fuer Dokument A und Dokument B separat -
+    steuert die in Core v3.16/3.17 ergaenzte Erkennung fuer PDF->Word-
+    konvertierte Dokumente, getrennt pro Dokument abschaltbar (diese
+    Heuristik ist nicht wasserdicht, siehe Core-Changelog v3.17).
 Version 2.8 / 2026-09-22 / Grund: Update passend zu docx_chapter_compare.py Version 3.11
 """
 
@@ -14,7 +19,7 @@ import webbrowser
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-GUI_VERSION = "2.8"
+GUI_VERSION = "2.9"
 
 try:
     import docx_chapter_compare as _core
@@ -155,6 +160,8 @@ class CompareApp(tk.Tk):
         self.var_status = tk.StringVar(value="Bereit.")
         self.var_ignore_linebreaks = tk.BooleanVar(value=self.cfg.get("ignore_linebreaks", True))
         self.var_detect_pages = tk.BooleanVar(value=self.cfg.get("detect_pages", True))
+        self.var_heading_number_a = tk.BooleanVar(value=self.cfg.get("heading_number_a", True))
+        self.var_heading_number_b = tk.BooleanVar(value=self.cfg.get("heading_number_b", True))
         self.var_detect_moves = tk.BooleanVar(value=self.cfg.get("detect_moves", True))
         self.var_export_docx = tk.BooleanVar(value=self.cfg.get("export_docx", False))
 
@@ -321,19 +328,30 @@ class CompareApp(tk.Tk):
             variable=self.var_export_docx,
         ).grid(row=9, column=0, columnspan=3, sticky="w", padx=10, pady=(2, 0))
 
+        ttk.Label(frame, text="Kapitelnummer aus Überschriftentext erkennen (bei PDF→Word-Konvertierung ohne",
+                  foreground="#666", font=("", 9)).grid(row=10, column=0, columnspan=3, sticky="w", padx=10, pady=(8, 0))
+        ttk.Label(frame, text="echte Nummerierung nötig — nicht wasserdicht, im Zweifel pro Dokument abschaltbar):",
+                  foreground="#666", font=("", 9)).grid(row=11, column=0, columnspan=3, sticky="w", padx=10)
+        ttk.Checkbutton(
+            frame, text="  Dokument A", variable=self.var_heading_number_a,
+        ).grid(row=12, column=0, sticky="w", padx=10, pady=(2, 0))
+        ttk.Checkbutton(
+            frame, text="Dokument B", variable=self.var_heading_number_b,
+        ).grid(row=12, column=1, sticky="w", pady=(2, 0))
+
         frame.columnconfigure(1, weight=1)
 
         self.btn_compare = ttk.Button(frame, text="Vergleichen ▶", command=self.run_compare)
-        self.btn_compare.grid(row=10, column=0, padx=10, pady=(16, 4), sticky="w")
+        self.btn_compare.grid(row=13, column=0, padx=10, pady=(16, 4), sticky="w")
 
         self.progress = ttk.Progressbar(frame, mode="determinate", maximum=1, value=0)
-        self.progress.grid(row=10, column=1, columnspan=2, padx=10, pady=(16, 4), sticky="ew")
+        self.progress.grid(row=13, column=1, columnspan=2, padx=10, pady=(16, 4), sticky="ew")
 
         self.progress_label = ttk.Label(frame, text="", foreground="#666", font=("", 9))
-        self.progress_label.grid(row=11, column=0, columnspan=3, sticky="w", padx=10)
+        self.progress_label.grid(row=14, column=0, columnspan=3, sticky="w", padx=10)
 
         self.stats_label = ttk.Label(frame, text="", justify="left")
-        self.stats_label.grid(row=12, column=0, columnspan=3, sticky="w", padx=10, pady=(6, 0))
+        self.stats_label.grid(row=15, column=0, columnspan=3, sticky="w", padx=10, pady=(6, 0))
 
         status_bar = ttk.Label(self, textvariable=self.var_status, relief="sunken", anchor="w")
         status_bar.pack(fill="x", side="bottom")
@@ -395,6 +413,8 @@ class CompareApp(tk.Tk):
         detect_pages = self.var_detect_pages.get()
         detect_moves = self.var_detect_moves.get()
         export_docx = self.var_export_docx.get()
+        heading_number_a = self.var_heading_number_a.get()
+        heading_number_b = self.var_heading_number_b.get()
 
         steps = ["Dokument A einlesen", "Dokument B einlesen"]
         if detect_pages:
@@ -414,7 +434,8 @@ class CompareApp(tk.Tk):
 
         thread = threading.Thread(
             target=self._worker,
-            args=(path_a, path_b, out_path, ignore_linebreaks, detect_pages, detect_moves, export_docx, len(steps)),
+            args=(path_a, path_b, out_path, ignore_linebreaks, detect_pages, detect_moves, export_docx, len(steps),
+                  heading_number_a, heading_number_b),
             daemon=True,
         )
         thread.start()
@@ -423,7 +444,8 @@ class CompareApp(tk.Tk):
         self.progress["value"] = i
         self.progress_label.config(text=f"[{i}/{total}] {label} …")
 
-    def _worker(self, path_a, path_b, out_path, ignore_linebreaks, detect_pages, detect_moves, export_docx, total_steps):
+    def _worker(self, path_a, path_b, out_path, ignore_linebreaks, detect_pages, detect_moves, export_docx, total_steps,
+                heading_number_a=True, heading_number_b=True):
         step_counter = [0]
 
         def advance(label):
@@ -432,9 +454,9 @@ class CompareApp(tk.Tk):
             self.after(0, lambda: self._set_progress(i, total_steps, label))
 
         try:
-            chapters_a = extract_chapters(path_a)
+            chapters_a = extract_chapters(path_a, allow_heading_typed_number=heading_number_a)
             advance("Dokument A einlesen")
-            chapters_b = extract_chapters(path_b)
+            chapters_b = extract_chapters(path_b, allow_heading_typed_number=heading_number_b)
             advance("Dokument B einlesen")
 
             if not chapters_a or not chapters_b:
@@ -487,6 +509,7 @@ class CompareApp(tk.Tk):
                 "doc_a": str(path_a), "doc_b": str(path_b), "out": str(out_path),
                 "ignore_linebreaks": ignore_linebreaks, "detect_pages": detect_pages,
                 "detect_moves": detect_moves, "export_docx": export_docx,
+                "heading_number_a": heading_number_a, "heading_number_b": heading_number_b,
             })
 
             self.after(0, lambda: self._on_success(out_path, stats, docx_path,
